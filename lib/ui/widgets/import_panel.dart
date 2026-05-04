@@ -13,12 +13,23 @@ import '../../services/library_service.dart';
 import '../../services/media_ingest_service.dart';
 import '../../services/plamus_paths.dart';
 import '../../services/youtube_search_service.dart';
+import '../screens/playlist_preview_screen.dart';
 
-/// Internal mode for the panel: paste a link vs. live YouTube search.
-enum _ImportMode { link, search }
+/// Internal mode for the panel: live YouTube search vs. paste a link.
+///
+/// Order matters: `search` is declared first because it is the default
+/// and leftmost tab in the UI (the primary way to add music). Paste-a-link
+/// is available as a secondary tab for users who already have a URL.
+enum _ImportMode { search, link }
 
-/// Shared import UI: URL field, pick files, drag-and-drop (desktop), and
-/// a YouTube search tab backed by the Plamus Railway extraction server.
+/// Shared import UI with two tabs:
+///
+///   1. **Search** (default / primary) — live YouTube search backed by
+///      the Plamus Railway extraction server. This is the recommended
+///      way to add music and is shown first on every platform.
+///   2. **Link** (secondary) — paste a URL + optional pick-files /
+///      drag-and-drop (desktop) for users who already have a direct
+///      link or a local audio file to ingest.
 ///
 /// The search tab is available on every platform (Windows, Linux, macOS,
 /// Android, iOS). The download path still differs per-platform:
@@ -95,7 +106,9 @@ class _ImportPanelState extends State<ImportPanel> {
   /// red helper line). Replaces the previous pink error snackbar.
   String? _errorMessage;
 
-  _ImportMode _mode = _ImportMode.link;
+  // Default to the search tab: the primary, discovery-driven way to add
+  // music. Users who already have a URL tap the secondary "Link" tab.
+  _ImportMode _mode = _ImportMode.search;
 
   /// Latest debounced search query token. Used so that a slow in-flight
   /// request does not overwrite the results of a newer query.
@@ -297,7 +310,7 @@ class _ImportPanelState extends State<ImportPanel> {
   }
 
   // ---------------------------------------------------------------------------
-  // Search tab (Linux desktop only)
+  // Search tab (default / primary — available on every platform)
   // ---------------------------------------------------------------------------
 
   /// Called on every keystroke. Cancels any in-flight debounce, then waits
@@ -347,10 +360,42 @@ class _ImportPanelState extends State<ImportPanel> {
 
   /// Triggered when the user taps a result row.
   ///
-  /// Reuses [_downloadUrl] so progress, error handling, and library
-  /// registration are identical to the link-paste flow.
+  /// Behavior depends on the result kind:
+  ///   * **Video** — reuses [_downloadUrl] so progress, error handling,
+  ///     and library registration are identical to the link-paste flow.
+  ///     [widget.onDone] fires after a successful download, matching the
+  ///     pre-existing behavior (e.g. closing the host import modal).
+  ///   * **Playlist** — pushes [PlaylistPreviewScreen], which fetches
+  ///     the full track list from `/playlist` and offers a "Download
+  ///     all" action that drives the same per-track pipeline (one URL
+  ///     at a time) via [TrackDownloadHelper]. The panel stays idle
+  ///     while the preview screen is on top, so the URL field /
+  ///     drag-and-drop continue to work after the user pops back. We
+  ///     deliberately do NOT call [widget.onDone] for playlist taps:
+  ///     the user might want to keep searching, and the preview screen
+  ///     itself surfaces a snackbar summarising the bulk download.
   Future<void> _onSearchResultTap(YoutubeSearchResult result) async {
     if (_busy) return;
+    if (result.isPlaylist) {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => PlaylistPreviewScreen(
+            playlistId: result.id,
+            playlistUrl: result.url,
+            initialTitle: result.title,
+            initialChannel: result.channel,
+            initialThumbnail: result.thumbnail,
+            initialTrackCount: result.trackCount,
+          ),
+        ),
+      );
+      // Refresh the library after we come back so any newly-downloaded
+      // tracks show up immediately in the host (library list, etc.).
+      // Guarded by `mounted` because the panel may have been disposed.
+      if (!mounted) return;
+      await context.read<LibraryService>().refreshAll();
+      return;
+    }
     await _setBusy(
       true,
       p: 0,
@@ -424,7 +469,7 @@ class _ImportPanelState extends State<ImportPanel> {
   }
 
   // ---------------------------------------------------------------------------
-  // Mode toggle (Link / Search)
+  // Mode toggle (Search / Link)
   // ---------------------------------------------------------------------------
 
   Widget _buildModeToggle(ThemeData theme) {
@@ -438,16 +483,18 @@ class _ImportPanelState extends State<ImportPanel> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: SegmentedButton<_ImportMode>(
+        // Search first (primary) and Link second (secondary) so the
+        // discovery-driven flow is the default on every platform.
         segments: const [
-          ButtonSegment(
-            value: _ImportMode.link,
-            label: Text('Link'),
-            icon: Icon(Icons.link),
-          ),
           ButtonSegment(
             value: _ImportMode.search,
             label: Text('Search'),
             icon: Icon(Icons.search),
+          ),
+          ButtonSegment(
+            value: _ImportMode.link,
+            label: Text('Link'),
+            icon: Icon(Icons.link),
           ),
         ],
         selected: {_mode},
@@ -478,7 +525,7 @@ class _ImportPanelState extends State<ImportPanel> {
   }
 
   // ---------------------------------------------------------------------------
-  // Link section (existing UX)
+  // Link section (secondary — for users who already have a URL)
   // ---------------------------------------------------------------------------
 
   Widget _buildLinkSection(ThemeData theme, {required bool isMobile}) {
@@ -727,6 +774,23 @@ class _SearchResultTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // Subtitle: channel · (duration | "N tracks"). Channel and the
+    // metadata field are joined only when both are present so we don't
+    // render stray bullets.
+    final metaLabel = result.isPlaylist
+        ? (result.trackCount > 0
+            ? '${result.trackCount} '
+                '${result.trackCount == 1 ? 'track' : 'tracks'}'
+            : '')
+        : formatShortDuration(result.durationSeconds);
+    final subtitleText = [
+      if (result.channel.isNotEmpty) result.channel,
+      if (metaLabel.isNotEmpty) metaLabel,
+    ].join(' \u00b7 ');
+    final trailingIcon =
+        result.isPlaylist ? Icons.queue_music : Icons.download;
+    // Tag rendered on top of the thumbnail so playlists are visually
+    // distinct at a glance even before you read the subtitle.
     return InkWell(
       onTap: onTap,
       child: Padding(
@@ -739,27 +803,72 @@ class _SearchResultTile extends StatelessWidget {
               child: SizedBox(
                 width: 96,
                 height: 54, // 16:9 thumbnail
-                child: Image.network(
-                  result.thumbnail,
-                  fit: BoxFit.cover,
-                  // Avoid layout jump while the image loads.
-                  loadingBuilder: (context, child, progress) {
-                    if (progress == null) return child;
-                    return ColoredBox(
-                      color: theme.colorScheme.surfaceContainerHighest,
-                      child: const Center(
-                        child: SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Image.network(
+                      result.thumbnail,
+                      fit: BoxFit.cover,
+                      // Avoid layout jump while the image loads.
+                      loadingBuilder: (context, child, progress) {
+                        if (progress == null) return child;
+                        return ColoredBox(
+                          color: theme.colorScheme.surfaceContainerHighest,
+                          child: const Center(
+                            child: SizedBox(
+                              width: 16,
+                              height: 16,
+                              child:
+                                  CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
+                        );
+                      },
+                      errorBuilder: (_, __, ___) => ColoredBox(
+                        color: theme.colorScheme.surfaceContainerHighest,
+                        child: Icon(
+                          result.isPlaylist
+                              ? Icons.queue_music
+                              : Icons.broken_image,
+                          size: 18,
                         ),
                       ),
-                    );
-                  },
-                  errorBuilder: (_, __, ___) => ColoredBox(
-                    color: theme.colorScheme.surfaceContainerHighest,
-                    child: const Icon(Icons.broken_image, size: 18),
-                  ),
+                    ),
+                    if (result.isPlaylist)
+                      Positioned(
+                        right: 4,
+                        bottom: 4,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.7),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.queue_music,
+                                size: 10,
+                                color: Colors.white,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                'Playlist',
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  height: 1,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
@@ -776,21 +885,23 @@ class _SearchResultTile extends StatelessWidget {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    result.channel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.textTheme.bodySmall?.color
-                          ?.withValues(alpha: 0.7),
+                  if (subtitleText.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitleText,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.textTheme.bodySmall?.color
+                            ?.withValues(alpha: 0.7),
+                      ),
                     ),
-                  ),
+                  ],
                 ],
               ),
             ),
             const SizedBox(width: 8),
-            const Icon(Icons.download, size: 18),
+            Icon(trailingIcon, size: 18),
           ],
         ),
       ),

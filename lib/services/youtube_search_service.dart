@@ -5,18 +5,40 @@ import 'dart:io' show HttpException;
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:http/http.dart' as http;
 
+/// Whether a [YoutubeSearchResult] points at a single video or a playlist
+/// of videos. Drives both the tile UI (duration vs. track count) and the
+/// tap behavior (direct download vs. open the preview screen).
+enum YoutubeSearchKind { video, playlist }
+
 /// One row in a search response from the Plamus extraction server.
+///
+/// The server can return either of:
+///   * `type: "video"` — single video with `duration_seconds`. Tapping it
+///     downloads via the existing per-track pipeline.
+///   * `type: "playlist"` — playlist with `track_count`. Tapping opens a
+///     preview screen that lists the playlist's tracks (fetched lazily
+///     from the `/playlist` endpoint) and offers "Download all".
+///
+/// All response fields are parsed defensively — missing or unexpected
+/// values default to a benign "video with unknown duration", so an older
+/// server build (pre-playlist support) still produces working video rows.
 class YoutubeSearchResult {
   /// Creates an immutable search result.
   const YoutubeSearchResult({
+    required this.kind,
     required this.id,
     required this.title,
     required this.channel,
     required this.thumbnail,
     required this.url,
+    this.durationSeconds = 0,
+    this.trackCount = 0,
   });
 
-  /// YouTube video id (e.g. `dQw4w9WgXcQ`). Useful as a stable key.
+  /// `video` or `playlist`.
+  final YoutubeSearchKind kind;
+
+  /// YouTube id — video id for [kind] = video, playlist id for playlist.
   final String id;
 
   /// Human-readable title with HTML entities already decoded.
@@ -28,18 +50,43 @@ class YoutubeSearchResult {
   /// Direct URL to the YouTube thumbnail (typically `mqdefault.jpg`).
   final String thumbnail;
 
-  /// Full `https://www.youtube.com/watch?v=…` URL — feeds straight into the
-  /// existing yt-dlp download pipeline.
+  /// Full URL — `https://www.youtube.com/watch?v=…` for videos,
+  /// `https://www.youtube.com/playlist?list=…` for playlists. The video
+  /// form feeds straight into the existing yt-dlp / extractor download
+  /// pipeline; the playlist form is forwarded to the `/playlist` endpoint
+  /// to enumerate its tracks.
   final String url;
 
+  /// Length of the video in seconds. `0` when unknown (older server) or
+  /// when [kind] is [YoutubeSearchKind.playlist].
+  final int durationSeconds;
+
+  /// Number of videos in the playlist. `0` when unknown or when [kind] is
+  /// [YoutubeSearchKind.video].
+  final int trackCount;
+
+  /// Convenience accessors so call sites read nicely.
+  bool get isVideo => kind == YoutubeSearchKind.video;
+  bool get isPlaylist => kind == YoutubeSearchKind.playlist;
+
   /// Builds a result from a single JSON object.
+  ///
+  /// Defaults [kind] to [YoutubeSearchKind.video] when `type` is missing
+  /// so we stay compatible with the pre-playlist server build.
   factory YoutubeSearchResult.fromJson(Map<String, dynamic> json) {
+    final rawType = (json['type'] ?? '').toString().toLowerCase();
+    final kind = rawType == 'playlist'
+        ? YoutubeSearchKind.playlist
+        : YoutubeSearchKind.video;
     return YoutubeSearchResult(
+      kind: kind,
       id: (json['id'] ?? '').toString(),
       title: _decodeHtmlEntities((json['title'] ?? '').toString()),
       channel: _decodeHtmlEntities((json['channel'] ?? '').toString()),
       thumbnail: (json['thumbnail'] ?? '').toString(),
       url: (json['url'] ?? '').toString(),
+      durationSeconds: _readInt(json['duration_seconds']),
+      trackCount: _readInt(json['track_count']),
     );
   }
 }
@@ -48,12 +95,17 @@ class YoutubeSearchResult {
 ///
 /// `GET https://web-production-1bab4.up.railway.app/search?q=<query>` →
 /// ```json
-/// { "results": [{ "id", "title", "channel", "thumbnail", "url" }, …] }
+/// { "results": [
+///     { "type": "video",    "id", "title", "channel", "thumbnail",
+///       "url", "duration_seconds" },
+///     { "type": "playlist", "id", "title", "channel", "thumbnail",
+///       "url", "track_count" },
+///     …
+///   ] }
 /// ```
 ///
-/// Same Railway instance that handles `/download` for mobile. Search support
-/// is currently surfaced on Linux desktop only — see
-/// `_ImportPanelState._supportsSearch` in `import_panel.dart`.
+/// Same Railway instance that handles `/download` for mobile and
+/// `/playlist` for full playlist listings (see [YoutubePlaylistService]).
 class YoutubeSearchService {
   YoutubeSearchService._();
 
@@ -114,8 +166,20 @@ class YoutubeSearchService {
 }
 
 // ---------------------------------------------------------------------------
-// HTML entity decoding
+// Internal helpers (shared with YoutubePlaylistService)
 // ---------------------------------------------------------------------------
+
+/// Reads an int from a JSON value that may be int, double, string, or null.
+/// Returns 0 for anything unparseable so the UI can simply hide the field.
+int _readInt(Object? raw) {
+  if (raw is int) return raw;
+  if (raw is double) return raw.toInt();
+  if (raw is String) {
+    final parsed = int.tryParse(raw.trim());
+    if (parsed != null) return parsed;
+  }
+  return 0;
+}
 
 const Map<String, String> _namedHtmlEntities = {
   'amp': '&',
@@ -160,4 +224,9 @@ String _decodeHtmlEntities(String input) {
   );
 }
 
+/// Decoder shared with [YoutubePlaylistService] so playlist track titles
+/// also have HTML entities resolved.
+String decodeYoutubeText(String input) => _decodeHtmlEntities(input);
 
+/// Public wrapper around the integer parser used by both services.
+int parseYoutubeInt(Object? raw) => _readInt(raw);
