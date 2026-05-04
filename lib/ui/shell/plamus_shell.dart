@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:provider/provider.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../../models/playlist_model.dart';
 import '../../services/audio_player_service.dart';
@@ -76,12 +79,41 @@ class _PlamusShellState extends State<PlamusShell> with SingleTickerProviderStat
     });
   }
 
+  /// Toggles fullscreen via `window_manager`. Shared between the F11 key
+  /// handler and any future UI entry points.
+  ///
+  /// No-op on platforms where `window_manager` is not initialized
+  /// (mobile) — the desktop shell is only used on Windows/Linux/macOS, but
+  /// the guard keeps the method safe in unit tests.
+  Future<void> _toggleFullScreen() async {
+    if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) return;
+    try {
+      final isFullScreen = await windowManager.isFullScreen();
+      await windowManager.setFullScreen(!isFullScreen);
+    } catch (e) {
+      debugPrint('F11 fullscreen toggle failed: $e');
+    }
+  }
 
+
+  /// Switches the shell body to a playlist. Used by both the sidebar tile
+  /// and the home screen's "Playlists" tab so both entry points end up at
+  /// the SAME [PlaylistDetailScreen] instance rendered INSIDE this shell
+  /// — the persistent [GlassPlayerBar] stays visible and the now-playing
+  /// context is scoped to the playlist surface (see [_openPlaylistById]).
   void _openPlaylist(PlaylistModel p) {
     if (p.id == null) return;
+    _openPlaylistById(p.id!);
+  }
+
+  /// Sibling of [_openPlaylist] that takes the playlist id directly.
+  /// Wired into [HomeLibraryScreen.onOpenPlaylist] so the tab uses the
+  /// shell's state-based navigation instead of pushing a new route over
+  /// the shell scaffold (which would hide the player bar).
+  void _openPlaylistById(int id) {
     setState(() {
       _section = PlamusSection.playlist;
-      _playlistId = p.id;
+      _playlistId = id;
     });
   }
 
@@ -141,7 +173,12 @@ class _PlamusShellState extends State<PlamusShell> with SingleTickerProviderStat
     final playlistId = _playlistId;
     switch (_section) {
       case PlamusSection.library:
-        return const HomeLibraryScreen();
+        // Pass the shell's state-based navigation as a callback so the
+        // home screen's "Playlists" tab opens playlists the SAME way as
+        // the sidebar (see _openPlaylist). Without this the tab would
+        // push a new route over the shell, hiding GlassPlayerBar and
+        // making the now-playing highlight scope ambiguous.
+        return HomeLibraryScreen(onOpenPlaylist: _openPlaylistById);
       case PlamusSection.importPage:
         return const ImportScreen();
       case PlamusSection.liked:
@@ -152,7 +189,7 @@ class _PlamusShellState extends State<PlamusShell> with SingleTickerProviderStat
         return const SettingsScreen();
       case PlamusSection.playlist:
         if (playlistId == null) {
-          return const HomeLibraryScreen();
+          return HomeLibraryScreen(onOpenPlaylist: _openPlaylistById);
         }
         return PlaylistDetailScreen(playlistId: playlistId);
     }
@@ -206,6 +243,21 @@ class _PlamusShellState extends State<PlamusShell> with SingleTickerProviderStat
             final newVolume = (audio.volume - 0.05).clamp(0.0, 1.0);
             audio.setVolumeLinear(newVolume);
             return KeyEventResult.handled;
+          }
+          // F11: Fullscreen toggle (BUG 2).
+          //
+          // The top-level `Shortcuts`/`Actions` in main.dart intercepts F11 on
+          // Windows/macOS but misses it on Linux — the focus never reaches the
+          // MaterialApp-level shortcut map when the shell's Focus widget has
+          // autofocused itself. Handling it here (same place as the other
+          // keyboard shortcuts) makes F11 work consistently on every desktop.
+          if (event.logicalKey == LogicalKeyboardKey.f11) {
+            if (Platform.isWindows ||
+                Platform.isLinux ||
+                Platform.isMacOS) {
+              _toggleFullScreen();
+              return KeyEventResult.handled;
+            }
           }
         }
         return KeyEventResult.ignored;
@@ -343,19 +395,14 @@ class _PlamusShellState extends State<PlamusShell> with SingleTickerProviderStat
           Expanded(
             child: Column(
               children: [
-                // Top bar with toggle button
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: Row(
-                    children: [
-                      IconButton(
-                        icon: Icon(_sidebarCollapsed ? Icons.menu : Icons.menu_open),
-                        onPressed: _toggleSidebar,
-                        tooltip: _sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar',
-                      ),
-                      const Spacer(),
-                    ],
-                  ),
+                // Top bar with sidebar toggle + (Linux only) drag-to-move
+                // area and custom window controls. The drag area wraps the
+                // empty space between the sidebar toggle and the window
+                // controls so the user can move the frameless window by
+                // grabbing any blank region in the top bar.
+                _TopBar(
+                  sidebarCollapsed: _sidebarCollapsed,
+                  onToggleSidebar: _toggleSidebar,
                 ),
                 Expanded(
                   child: AnimatedSwitcher(
@@ -376,6 +423,160 @@ class _PlamusShellState extends State<PlamusShell> with SingleTickerProviderStat
           ),
         ],
       ),
+      ),
+    );
+  }
+}
+
+/// Desktop top bar: sidebar toggle on the left; on Linux, the rest of the
+/// strip is a drag-to-move region plus minimize / maximize / close buttons
+/// so the user can still move and resize the window after we've hidden the
+/// native title bar (BUG 1).
+class _TopBar extends StatelessWidget {
+  const _TopBar({
+    required this.sidebarCollapsed,
+    required this.onToggleSidebar,
+  });
+
+  final bool sidebarCollapsed;
+  final VoidCallback onToggleSidebar;
+
+  @override
+  Widget build(BuildContext context) {
+    final isLinux = Platform.isLinux;
+    final toggle = IconButton(
+      icon: Icon(sidebarCollapsed ? Icons.menu : Icons.menu_open),
+      onPressed: onToggleSidebar,
+      tooltip: sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar',
+    );
+
+    // Non-Linux: keep the original lightweight top bar exactly as before.
+    if (!isLinux) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            toggle,
+            const Spacer(),
+          ],
+        ),
+      );
+    }
+
+    // Linux: the native title bar is hidden. Reuse this strip as a drag
+    // region (via `DragToMoveArea`) and append window controls so users
+    // can still move, minimize, maximize and close the window.
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          toggle,
+          Expanded(
+            child: DragToMoveArea(
+              child: Container(
+                // Transparent fill so the whole strip is hit-testable by
+                // GestureDetector inside DragToMoveArea.
+                color: Colors.transparent,
+                alignment: Alignment.centerLeft,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  'Plamus',
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: Theme.of(context)
+                            .textTheme
+                            .labelMedium
+                            ?.color
+                            ?.withValues(alpha: 0.55),
+                        letterSpacing: 0.8,
+                      ),
+                ),
+              ),
+            ),
+          ),
+          const _WindowControlButton(
+            tooltip: 'Minimize',
+            icon: Icons.remove,
+            kind: _WindowControl.minimize,
+          ),
+          const _WindowControlButton(
+            tooltip: 'Maximize / restore',
+            icon: Icons.crop_square,
+            kind: _WindowControl.maximize,
+          ),
+          const _WindowControlButton(
+            tooltip: 'Close',
+            icon: Icons.close,
+            kind: _WindowControl.close,
+            isClose: true,
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+    );
+  }
+}
+
+/// Which window-manager action a [_WindowControlButton] dispatches.
+enum _WindowControl { minimize, maximize, close }
+
+class _WindowControlButton extends StatelessWidget {
+  const _WindowControlButton({
+    required this.tooltip,
+    required this.icon,
+    required this.kind,
+    this.isClose = false,
+  });
+
+  final String tooltip;
+  final IconData icon;
+  final _WindowControl kind;
+
+  /// Close gets a red hover highlight, mirroring typical borderless desktop
+  /// apps; minimize/maximize stay neutral.
+  final bool isClose;
+
+  Future<void> _dispatch() async {
+    try {
+      switch (kind) {
+        case _WindowControl.minimize:
+          await windowManager.minimize();
+          break;
+        case _WindowControl.maximize:
+          final maximized = await windowManager.isMaximized();
+          if (maximized) {
+            await windowManager.unmaximize();
+          } else {
+            await windowManager.maximize();
+          }
+          break;
+        case _WindowControl.close:
+          await windowManager.close();
+          break;
+      }
+    } catch (e) {
+      debugPrint('Window control $kind failed: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: _dispatch,
+        hoverColor: isClose
+            ? theme.colorScheme.error.withValues(alpha: 0.2)
+            : theme.colorScheme.onSurface.withValues(alpha: 0.08),
+        child: SizedBox(
+          width: 44,
+          height: 44,
+          child: Icon(
+            icon,
+            size: 16,
+            color: theme.colorScheme.onSurface.withValues(alpha: 0.75),
+          ),
+        ),
       ),
     );
   }

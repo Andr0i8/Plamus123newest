@@ -45,10 +45,13 @@ class DownloadService {
       throw ArgumentError.value(url, 'url', 'URL must not be empty');
     }
     if (!File(ytDlpExecutablePath).existsSync()) {
-      throw StateError(
-        'yt-dlp not found at "$ytDlpExecutablePath". '
-        'Place yt-dlp.exe in assets/bin/ and restart the app.',
-      );
+      // Tailor the recovery hint per OS — on Windows we ship the binary in
+      // assets, on Linux we download it on first run, on macOS it's still
+      // bundled the same way as Windows.
+      final hint = Platform.isLinux
+          ? 'Restart Plamus to redownload yt-dlp, or place a yt-dlp binary at "$ytDlpExecutablePath".'
+          : 'Place yt-dlp.exe in assets/bin/ and restart the app.';
+      throw StateError('yt-dlp not found at "$ytDlpExecutablePath". $hint');
     }
 
     final outDir = Directory(outputDirectory);

@@ -12,6 +12,11 @@ class ImportScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final lib = context.read<LibraryService>();
+    // BUG 4: no outer `SingleChildScrollView` — the `ImportPanel` expands to
+    // fill the Scaffold body so link-mode (URL field + buttons + drag-drop)
+    // and search-mode (query + results) each fit without scrolling. The
+    // `fillHeight: true` flag tells the panel to use `Expanded` for its
+    // variable-height sections.
     return Scaffold(
       body: Padding(
         padding: const EdgeInsets.all(24),
@@ -26,10 +31,9 @@ class ImportScreen extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             Expanded(
-              child: SingleChildScrollView(
-                child: ImportPanel(
-                  onDone: () => lib.refreshAll(),
-                ),
+              child: ImportPanel(
+                fillHeight: true,
+                onDone: () => lib.refreshAll(),
               ),
             ),
           ],

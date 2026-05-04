@@ -31,8 +31,15 @@ class PlamusTheme {
   PlamusTheme._();
 
   /// Dark Material 3 theme tuned for a music desktop app.
-  static ThemeData dark({Color? accentColor}) {
+  ///
+  /// [textColor] overrides the default high-emphasis foreground color
+  /// (white for dark / black for light) and is propagated through the
+  /// `textTheme`, `iconTheme`, `listTileTheme`, and `colorScheme.onSurface`
+  /// so it reaches every widget that reads any of those — track titles,
+  /// artist names, timestamps, popup-menu items, sidebar labels, etc.
+  static ThemeData dark({Color? accentColor, Color? textColor}) {
     final accent = accentColor ?? PlamusColors.primary;
+    final txt = textColor ?? PlamusColors.darkText;
     final base = ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
@@ -40,20 +47,26 @@ class PlamusTheme {
         surface: PlamusColors.darkBackground,
         primary: accent,
         onPrimary: Colors.white,
-        onSurface: PlamusColors.darkText,
+        onSurface: txt,
       ),
       scaffoldBackgroundColor: PlamusColors.darkBackground,
     );
     return base.copyWith(
+      // Apply the chosen text color to every text style at once. Most
+      // app widgets style via `theme.textTheme.titleSmall?.copyWith(...)`
+      // etc., so anchoring `bodyColor` + `displayColor` here flows
+      // through the rest of the UI without per-widget changes.
+      textTheme: base.textTheme.apply(bodyColor: txt, displayColor: txt),
+      iconTheme: IconThemeData(color: txt.withValues(alpha: 0.85)),
       navigationRailTheme: NavigationRailThemeData(
         backgroundColor: PlamusColors.darkSidebar,
         selectedIconTheme: IconThemeData(color: accent),
-        selectedLabelTextStyle: const TextStyle(color: PlamusColors.darkText),
-        unselectedLabelTextStyle: TextStyle(color: PlamusColors.darkText.withValues(alpha: 0.65)),
+        selectedLabelTextStyle: TextStyle(color: txt),
+        unselectedLabelTextStyle: TextStyle(color: txt.withValues(alpha: 0.65)),
       ),
       listTileTheme: ListTileThemeData(
-        textColor: PlamusColors.darkText,
-        iconColor: PlamusColors.darkText.withValues(alpha: 0.85),
+        textColor: txt,
+        iconColor: txt.withValues(alpha: 0.85),
       ),
       dividerTheme: DividerThemeData(color: Colors.white.withValues(alpha: 0.08)),
       sliderTheme: SliderThemeData(
@@ -108,9 +121,10 @@ class PlamusTheme {
     );
   }
 
-  /// Light Material 3 theme.
-  static ThemeData light({Color? accentColor}) {
+  /// Light Material 3 theme. See [dark] for the [textColor] semantics.
+  static ThemeData light({Color? accentColor, Color? textColor}) {
     final accent = accentColor ?? PlamusColors.primary;
+    final txt = textColor ?? PlamusColors.lightText;
     final base = ThemeData(
       useMaterial3: true,
       brightness: Brightness.light,
@@ -118,20 +132,22 @@ class PlamusTheme {
         surface: PlamusColors.lightBackground,
         primary: accent,
         onPrimary: Colors.white,
-        onSurface: PlamusColors.lightText,
+        onSurface: txt,
       ),
       scaffoldBackgroundColor: PlamusColors.lightBackground,
     );
     return base.copyWith(
+      textTheme: base.textTheme.apply(bodyColor: txt, displayColor: txt),
+      iconTheme: IconThemeData(color: txt.withValues(alpha: 0.85)),
       navigationRailTheme: NavigationRailThemeData(
         backgroundColor: PlamusColors.lightSidebar,
         selectedIconTheme: IconThemeData(color: accent),
-        selectedLabelTextStyle: const TextStyle(color: PlamusColors.lightText),
-        unselectedLabelTextStyle: TextStyle(color: PlamusColors.lightText.withValues(alpha: 0.65)),
+        selectedLabelTextStyle: TextStyle(color: txt),
+        unselectedLabelTextStyle: TextStyle(color: txt.withValues(alpha: 0.65)),
       ),
       listTileTheme: ListTileThemeData(
-        textColor: PlamusColors.lightText,
-        iconColor: PlamusColors.lightText.withValues(alpha: 0.85),
+        textColor: txt,
+        iconColor: txt.withValues(alpha: 0.85),
       ),
       dividerTheme: DividerThemeData(color: Colors.black.withValues(alpha: 0.06)),
       sliderTheme: SliderThemeData(

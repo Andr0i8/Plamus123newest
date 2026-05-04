@@ -21,7 +21,22 @@
       "Exec(cat)",
       "Exec(adb logcat)",
       "Exec(adb devices)",
-      "Exec(adb shell)"
+      "Exec(adb shell)",
+      "Exec(uname)",
+      "Exec(rg)",
+      "Exec(git stash)",
+      "Exec(sleep)",
+      "Exec(pkill)",
+      "Exec(/home/andrii/.local/share/plamus/bin/yt-dlp)",
+      "Exec(git status)",
+      "Exec(git diff)",
+      "Exec(dart run)",
+      "Exec(cp)",
+      "Exec(./plamus)",
+      "Exec(xdotool search)",
+      "Exec(pgrep)",
+      "Exec(git log)",
+      "Exec(stat)"
     ]
   }
 }

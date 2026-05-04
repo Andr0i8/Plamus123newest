@@ -22,6 +22,7 @@ dependencies:
   # These are no-ops on Android — the plugin's native code is excluded
   # by Flutter's platform detection during build.
   media_kit_libs_windows_audio: any
+  media_kit_libs_linux: any
 
   # SQLite: desktop uses sqflite_common_ffi, mobile uses sqflite.
   sqflite_common_ffi: ^2.3.4

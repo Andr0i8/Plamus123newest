@@ -55,9 +55,19 @@ class MediaIngestService {
       if (appData == null) throw StateError('APPDATA not found');
       return p.join(appData, 'Plamus', 'library');
     } else if (Platform.isLinux) {
+      // Match PlamusPaths.applicationSupportDirectory() — lowercase to follow
+      // the XDG convention and the documented `~/.local/share/plamus/` spec.
+      final xdg = Platform.environment['XDG_DATA_HOME'];
       final home = Platform.environment['HOME'];
-      if (home == null) throw StateError('HOME not found');
-      return p.join(home, '.local', 'share', 'Plamus', 'library');
+      final base = (xdg != null && xdg.isNotEmpty)
+          ? xdg
+          : (home != null && home.isNotEmpty
+              ? p.join(home, '.local', 'share')
+              : null);
+      if (base == null) {
+        throw StateError('HOME or XDG_DATA_HOME not set');
+      }
+      return p.join(base, 'plamus', 'library');
     } else if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
       if (home == null) throw StateError('HOME not found');
@@ -133,8 +143,14 @@ class MediaIngestService {
   }) async {
     final res = BinaryService.instance.lastResolution;
     if (res == null || !res.ffmpegAvailable) {
+      // Different recovery story per OS — on Linux ffmpeg comes from the
+      // package manager, on Windows/macOS it ships as an asset.
+      final hint = Platform.isLinux
+          ? 'Install ffmpeg via your package manager '
+              '(Arch: sudo pacman -S ffmpeg, Ubuntu/Debian: sudo apt install ffmpeg).'
+          : 'Add ffmpeg.exe to assets/bin/ and restart.';
       throw StateError(
-        'ffmpeg is not available. Add ffmpeg.exe to assets/bin/ and restart. '
+        'ffmpeg is not available. $hint '
         '${res?.errors.join(' ') ?? ''}',
       );
     }

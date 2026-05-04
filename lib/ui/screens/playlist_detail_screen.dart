@@ -8,6 +8,7 @@ import '../../models/playlist_model.dart';
 import '../../models/track_model.dart';
 import '../../services/audio_player_service.dart';
 import '../../services/library_service.dart';
+import '../widgets/glass_player_bar.dart';
 import '../widgets/import_panel.dart';
 import '../widgets/mobile_mini_player.dart';
 import '../widgets/track_tile.dart';
@@ -255,6 +256,12 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
     // playlist screen is pushed as a route and the user needs the arrow
     // to get back to the library list (BUG 6).
     final canPop = Navigator.of(context).canPop();
+    // Defensive: if a desktop caller ever pushes this screen as a new
+    // route (canPop == true) instead of routing through the shell's
+    // state, the shell's persistent GlassPlayerBar gets covered. Render
+    // our own copy in that case so the bottom player is NEVER missing,
+    // regardless of how the user got here.
+    final showDesktopPlayerBar = !isMobile && canPop;
 
     return FutureBuilder<PlaylistModel?>(
       future: _meta,
@@ -273,11 +280,19 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
               ),
             ],
           ),
-          // Mobile: pin the mini-player to the bottom of this route since
-          // the outer shell's bottomNavigationBar is hidden while we're on
-          // top of the Navigator stack (BUG 7). Desktop already renders
-          // GlassPlayerBar inside `PlamusShell`.
-          bottomNavigationBar: isMobile ? const MobileMiniPlayer() : null,
+          // Bottom player wiring per platform / navigation source:
+          //   • Mobile: always render MobileMiniPlayer because the outer
+          //     shell's bottom nav is covered by this pushed route
+          //     (BUG 7).
+          //   • Desktop, embedded in shell (canPop == false): null — the
+          //     shell renders its own GlassPlayerBar below the body.
+          //   • Desktop, pushed as a route (canPop == true): render
+          //     GlassPlayerBar here as a defensive fallback so the
+          //     player bar never disappears even if a future call site
+          //     uses Navigator.push instead of the shell callback.
+          bottomNavigationBar: isMobile
+              ? const MobileMiniPlayer()
+              : (showDesktopPlayerBar ? const GlassPlayerBar() : null),
           body: FutureBuilder<List<TrackModel>>(
             future: _tracks,
             builder: (context, trackSnap) {

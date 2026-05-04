@@ -37,16 +37,25 @@ Future<void> main() async {
     ]);
   }
 
-  // Desktop: Initialize window manager for fullscreen support
+  // Desktop: Initialize window manager for fullscreen support.
+  //
+  // Linux gets a borderless window (BUG 1): `TitleBarStyle.hidden` tells
+  // window_manager to either hide the GTK header bar created by
+  // `my_application.cc` (on GNOME) or call `gtk_window_set_decorated(false)`
+  // (other WMs). Users drag the window via the custom top bar in
+  // `PlamusShell` that wraps `DragToMoveArea`.
+  //
+  // Windows/macOS keep their native title bars, matching the previous UX.
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
 
-    const windowOptions = WindowOptions(
-      minimumSize: Size(800, 600),
+    final windowOptions = WindowOptions(
+      minimumSize: const Size(800, 600),
       center: true,
       backgroundColor: Colors.transparent,
       skipTaskbar: false,
-      titleBarStyle: TitleBarStyle.normal,
+      titleBarStyle:
+          Platform.isLinux ? TitleBarStyle.hidden : TitleBarStyle.normal,
     );
 
     await windowManager.waitUntilReadyToShow(windowOptions, () async {
@@ -55,11 +64,13 @@ Future<void> main() async {
     });
   }
 
-  // Desktop: media_kit backend required for just_audio.
-  if (Platform.isWindows) {
+  // Desktop: media_kit backend required for just_audio on Windows + Linux.
+  // Linux uses libmpv from media_kit_libs_linux; Windows uses bundled libs
+  // from media_kit_libs_windows_audio.
+  if (Platform.isWindows || Platform.isLinux) {
     JustAudioMediaKit.ensureInitialized(
       windows: true,
-      linux: false,
+      linux: true,
     );
     JustAudioMediaKit.title = 'Plamus';
     // Note: media_kit handles caching internally for local files
@@ -136,54 +147,34 @@ class _PlamusAppState extends State<PlamusApp> {
     });
   }
 
-  Future<void> _handleF11() async {
-    if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) return;
-
-    try {
-      final isFullScreen = await windowManager.isFullScreen();
-      if (isFullScreen) {
-        await windowManager.setFullScreen(false);
-      } else {
-        await windowManager.setFullScreen(true);
-      }
-    } catch (e) {
-      debugPrint('F11 fullscreen toggle failed: $e');
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final themeCtrl = context.watch<ThemeController>();
 
-    return Shortcuts(
-      shortcuts: <LogicalKeySet, Intent>{
-        LogicalKeySet(LogicalKeyboardKey.f11): const _FullscreenIntent(),
-      },
-      child: Actions(
-        actions: <Type, Action<Intent>>{
-          _FullscreenIntent: CallbackAction<_FullscreenIntent>(
-            onInvoke: (_) {
-              _handleF11();
-              return null;
-            },
-          ),
-        },
-        child: MaterialApp(
-          title: 'Plamus',
-          debugShowCheckedModeBanner: false,
-          theme: PlamusTheme.light(accentColor: themeCtrl.accentColor),
-          darkTheme: PlamusTheme.dark(accentColor: themeCtrl.accentColor),
-          themeMode: themeCtrl.mode,
-          home: Platform.isAndroid || Platform.isIOS
-              ? const PlamusShellMobile()
-              : const PlamusShell(),
-        ),
+    // F11 fullscreen is handled directly in `PlamusShell`'s `Focus.onKeyEvent`
+    // (see BUG 2). Keeping it there rather than in a top-level
+    // `Shortcuts`/`Actions` map gives us consistent behavior on Linux, where
+    // focus routing to MaterialApp-level shortcuts was unreliable, and
+    // avoids double-toggling when both paths fire.
+    return MaterialApp(
+      title: 'Plamus',
+      debugShowCheckedModeBanner: false,
+      // Resolve the user's text-color choice once per brightness so
+      // the "auto" default still maps to white-on-dark / black-on-light
+      // while an explicit custom color (picked in Settings) wins in
+      // both themes.
+      theme: PlamusTheme.light(
+        accentColor: themeCtrl.accentColor,
+        textColor: themeCtrl.textColorFor(Brightness.light),
       ),
+      darkTheme: PlamusTheme.dark(
+        accentColor: themeCtrl.accentColor,
+        textColor: themeCtrl.textColorFor(Brightness.dark),
+      ),
+      themeMode: themeCtrl.mode,
+      home: Platform.isAndroid || Platform.isIOS
+          ? const PlamusShellMobile()
+          : const PlamusShell(),
     );
   }
-}
-
-/// Intent for F11 fullscreen toggle.
-class _FullscreenIntent extends Intent {
-  const _FullscreenIntent();
 }

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
@@ -49,6 +50,22 @@ class AudioPlayerService extends ChangeNotifier {
 
   /// Public read-only view of [_shuffleEnabled].
   bool get shuffleEnabled => _shuffleEnabled;
+
+  /// Snapshot of the queue order BEFORE shuffle was turned on. Used by
+  /// [toggleShuffle] to put the queue back in its original sequence when
+  /// shuffle is disabled. Empty whenever shuffle is OFF.
+  List<TrackModel> _originalQueue = [];
+
+  /// Stack of tracks the user has actually heard during the current
+  /// shuffle session, newest on top. [skipPrevious] pops from this when
+  /// shuffle is on so "previous" walks back through the order tracks
+  /// were really played in (Spotify-style back-stack), instead of just
+  /// the queue index, which would be unhelpful after a reshuffle.
+  final List<TrackModel> _playHistory = [];
+
+  /// Random source used for queue shuffling — held as a field to keep
+  /// behavior deterministically swappable in unit tests.
+  final Random _random = Random();
 
   /// Identifier of the surface that started current playback (see
   /// [PlaybackContextId]). `null` when nothing is playing.
@@ -155,6 +172,40 @@ class AudioPlayerService extends ChangeNotifier {
       if (index != null && index >= 0 && index < _queue.length) {
         _recordPlayForTrack(_queue[index]);
 
+        // Shuffle back-stack on auto-advance (RepeatMode.all). When the
+        // engine moves forward on its own (track ended naturally), push
+        // the OUTGOING track onto _playHistory so a subsequent
+        // skipPrevious can step back through real listening order. We
+        // skip this when our own toggleShuffle / reshuffle is rebuilding
+        // the source (_isHandlingIndexChange) and dedupe against the
+        // last entry to avoid double-push when skipNext also added it.
+        if (_shuffleEnabled &&
+            !_isHandlingIndexChange &&
+            _lastKnownIndex != null &&
+            index != _lastKnownIndex &&
+            _lastKnownIndex! >= 0 &&
+            _lastKnownIndex! < _queue.length) {
+          final outgoing = _queue[_lastKnownIndex!];
+          if (_playHistory.isEmpty ||
+              _playHistory.last.id != outgoing.id) {
+            _playHistory.add(outgoing);
+          }
+
+          // End-of-shuffled-queue auto-wrap (RepeatMode.all): the
+          // engine just looped from the last index back to 0. Generate
+          // a fresh random order so the listener doesn't hear the same
+          // shuffled sequence on every loop. We schedule this as a
+          // microtask so the engine finishes its own state update
+          // before we swap the audio source.
+          final wrapped = _lastKnownIndex! == _queue.length - 1 &&
+              index == 0 &&
+              repeatMode == RepeatMode.all &&
+              _queue.length > 1;
+          if (wrapped) {
+            scheduleMicrotask(_reshuffleAndRestart);
+          }
+        }
+
         // Detect unwanted auto-advance when repeat is OFF
         if (!_isHandlingIndexChange &&
             _lastKnownIndex != null &&
@@ -195,6 +246,11 @@ class AudioPlayerService extends ChangeNotifier {
   /// [PlaybackContextId]). Track tiles use it to decide whether to render the
   /// "now playing" highlight, so the same track playing from a playlist
   /// doesn't also light up in the main library.
+  ///
+  /// Shuffle interaction: if shuffle is currently ON, the new queue is
+  /// reshuffled here so the chosen track plays first and the rest land
+  /// in random order — same UX as Spotify when you tap a track from a
+  /// list while shuffle is engaged.
   Future<void> setQueue(
     List<TrackModel> tracks, {
     int startIndex = 0,
@@ -208,35 +264,37 @@ class AudioPlayerService extends ChangeNotifier {
 
     _queue = List<TrackModel>.from(tracks);
     _playbackContextId = contextId;
+    // A fresh queue invalidates any previous shuffle session bookkeeping:
+    // the back-stack and the original-order snapshot belong to the
+    // PREVIOUS queue and would only confuse skipPrevious if reused.
+    _playHistory.clear();
+    _originalQueue = [];
+
     final safeIndex = startIndex.clamp(0, _queue.length - 1);
-    _lastKnownIndex = safeIndex;
+    int initialIndex = safeIndex;
 
-    final playlist = ja.ConcatenatingAudioSource(
-      children: _queue.map((t) {
-        // Create MediaItem for mobile platforms
-        final mediaItem = MediaItem(
-          id: t.id?.toString() ?? t.filePath,
-          album: 'Library',
-          title: t.title,
-          artist: t.artist,
-          duration: t.durationMs > 0 ? Duration(milliseconds: t.durationMs) : null,
-        );
+    if (_shuffleEnabled && _queue.length > 1) {
+      // Save the un-shuffled order so a later toggleShuffle() can
+      // restore it, then shuffle the queue with the user's clicked
+      // track pinned to the front so playback doesn't leap to a
+      // random song.
+      _originalQueue = List<TrackModel>.from(_queue);
+      final clicked = _queue[safeIndex];
+      final others = [
+        ..._queue.sublist(0, safeIndex),
+        ..._queue.sublist(safeIndex + 1),
+      ]..shuffle(_random);
+      _queue = [clicked, ...others];
+      initialIndex = 0;
+    }
 
-        // CRITICAL: Only use tag on mobile to avoid sequence validation errors
-        return Platform.isAndroid || Platform.isIOS
-            ? ja.AudioSource.file(t.filePath, tag: mediaItem)
-            : ja.AudioSource.file(t.filePath);
-      }).toList(),
-    );
+    _lastKnownIndex = initialIndex;
 
     try {
-      await _player.setAudioSource(playlist, initialIndex: safeIndex);
-      // Re-apply shuffle state to the new source.
-      await _player.setShuffleModeEnabled(_shuffleEnabled);
-      if (_shuffleEnabled) {
-        // Generate a fresh shuffled order, keeping the chosen track current.
-        await _player.shuffle();
-      }
+      await _player.setAudioSource(
+        _buildAudioSource(_queue),
+        initialIndex: initialIndex,
+      );
       if (playImmediately) {
         await _player.play();
       }
@@ -245,6 +303,34 @@ class AudioPlayerService extends ChangeNotifier {
       rethrow;
     }
     notifyListeners();
+  }
+
+  /// Builds a [ja.ConcatenatingAudioSource] from [tracks]. Extracted so
+  /// shuffle toggles can rebuild the engine source from the same code
+  /// path that [setQueue] uses, keeping the mobile-vs-desktop tag
+  /// behavior in one place.
+  ja.ConcatenatingAudioSource _buildAudioSource(List<TrackModel> tracks) {
+    return ja.ConcatenatingAudioSource(
+      children: tracks.map((t) {
+        // Create MediaItem for mobile platforms (powers media-session
+        // notifications via just_audio_background).
+        final mediaItem = MediaItem(
+          id: t.id?.toString() ?? t.filePath,
+          album: 'Library',
+          title: t.title,
+          artist: t.artist,
+          duration: t.durationMs > 0
+              ? Duration(milliseconds: t.durationMs)
+              : null,
+        );
+
+        // CRITICAL: Only attach the tag on mobile to avoid sequence
+        // validation errors in just_audio's desktop (media_kit) path.
+        return Platform.isAndroid || Platform.isIOS
+            ? ja.AudioSource.file(t.filePath, tag: mediaItem)
+            : ja.AudioSource.file(t.filePath);
+      }).toList(),
+    );
   }
 
   /// Plays a single track from a list context.
@@ -319,6 +405,8 @@ class AudioPlayerService extends ChangeNotifier {
   Future<void> stop() async {
     await _player.stop();
     _queue = [];
+    _originalQueue = [];
+    _playHistory.clear();
     _lastKnownIndex = null;
     _playbackContextId = null;
     notifyListeners();
@@ -352,36 +440,123 @@ class AudioPlayerService extends ChangeNotifier {
   /// Gets current repeat mode (for UI).
   RepeatMode get currentRepeatMode => repeatMode;
 
-  /// Toggles shuffle mode on/off.
+  /// Toggles shuffle mode on/off — Spotify-style.
   ///
-  /// When enabled: just_audio randomizes the queue order; previous/next
-  /// traverse the shuffled sequence (so the back-stack of already-played
-  /// tracks is preserved). When disabled: returns to the original queue
-  /// order. The current track always keeps playing, regardless of state.
+  /// Enabling: snapshot the current queue into [_originalQueue], then
+  /// rebuild the engine queue with the currently-playing track at the
+  /// front and every other track behind it in random order. The track
+  /// currently playing keeps playing without interruption — only the
+  /// order of what comes next changes.
   ///
-  /// The state is also remembered when the queue is empty, so toggling
-  /// before selecting the first track still "sticks" once a queue gets
-  /// loaded (see the apply in [setQueue]).
+  /// Disabling: restore [_originalQueue] verbatim, then seek to the
+  /// current track's position in that original sequence. Again, the
+  /// current track keeps playing; only the rest of the order resets.
+  ///
+  /// Either way, the back-stack ([_playHistory]) is reset because the
+  /// queue layout changed and the old "previous" entries no longer
+  /// describe a meaningful walk-back through the new order.
+  ///
+  /// If the queue is empty we just flip the preference; it'll get
+  /// applied the next time [setQueue] runs.
   Future<void> toggleShuffle() async {
-    _shuffleEnabled = !_shuffleEnabled;
-    notifyListeners();
-
-    // No source yet? Remember the preference; it's re-applied in setQueue.
-    if (_queue.isEmpty) return;
-
-    try {
-      await _player.setShuffleModeEnabled(_shuffleEnabled);
-      if (_shuffleEnabled) {
-        // Generate a fresh shuffled order; just_audio anchors it on the
-        // current item so playback doesn't jump.
-        await _player.shuffle();
-      }
-    } catch (e) {
-      debugPrint('AudioPlayerService: failed to toggle shuffle: $e');
-      // Roll back the boolean if the engine call failed so UI stays in sync.
+    if (_queue.isEmpty) {
       _shuffleEnabled = !_shuffleEnabled;
       notifyListeners();
+      return;
     }
+
+    final wasPlaying = _player.playing;
+    final position = _player.position;
+    final currentIdx = _player.currentIndex ?? 0;
+    final clampedIdx = currentIdx.clamp(0, _queue.length - 1);
+    final currentTrack = _queue[clampedIdx];
+
+    _shuffleEnabled = !_shuffleEnabled;
+
+    if (_shuffleEnabled) {
+      // Enable shuffle: snapshot original order, build a fresh queue
+      // with the current track first and the rest randomized after it.
+      _originalQueue = List<TrackModel>.from(_queue);
+      final remaining = [
+        ..._queue.sublist(0, clampedIdx),
+        ..._queue.sublist(clampedIdx + 1),
+      ]..shuffle(_random);
+      _queue = [currentTrack, ...remaining];
+    } else {
+      // Disable shuffle: restore original order. If we never captured
+      // one (shouldn't happen, but be safe), keep the current queue
+      // as-is so we don't blow away the user's playback.
+      if (_originalQueue.isNotEmpty) {
+        _queue = List<TrackModel>.from(_originalQueue);
+      }
+      _originalQueue = [];
+    }
+
+    // Find the current track in the new queue layout. It MUST exist
+    // (we built the new queue around it) but defensively fall back to
+    // index 0 if anything is wrong so we don't crash mid-playback.
+    final newIdx = _queue.indexWhere((t) => t.id == currentTrack.id);
+    final safeIdx = newIdx >= 0 ? newIdx : 0;
+    _lastKnownIndex = safeIdx;
+    _playHistory.clear();
+
+    try {
+      // Suppress the auto-advance guard while the engine reloads the
+      // source — it could otherwise observe transient index 0 and yank
+      // us back, even though the user explicitly toggled shuffle.
+      _isHandlingIndexChange = true;
+      await _player.setAudioSource(
+        _buildAudioSource(_queue),
+        initialIndex: safeIdx,
+        initialPosition: position,
+      );
+      if (wasPlaying) {
+        await _player.play();
+      }
+    } catch (e) {
+      debugPrint('AudioPlayerService: toggleShuffle failed: $e');
+    } finally {
+      _isHandlingIndexChange = false;
+    }
+    notifyListeners();
+  }
+
+  /// Re-randomizes the entire queue while keeping shuffle on. Called
+  /// when [skipNext] reaches the end of the shuffled queue with
+  /// [RepeatMode.all], so the user keeps getting fresh random order
+  /// instead of replaying the same shuffled sequence forever.
+  ///
+  /// The track that just finished is rotated away from index 0 so the
+  /// "next" track after the loop boundary can't be the same one the
+  /// listener literally just heard.
+  Future<void> _reshuffleAndRestart() async {
+    if (_queue.isEmpty) return;
+
+    final lastPlayed = currentTrack;
+    final shuffled = List<TrackModel>.from(_queue)..shuffle(_random);
+    if (lastPlayed != null &&
+        shuffled.length > 1 &&
+        shuffled.first.id == lastPlayed.id) {
+      // Rotate so the same song doesn't immediately replay.
+      shuffled.add(shuffled.removeAt(0));
+    }
+    _queue = shuffled;
+    _playHistory.clear();
+    _lastKnownIndex = 0;
+
+    try {
+      _isHandlingIndexChange = true;
+      await _player.setAudioSource(
+        _buildAudioSource(_queue),
+        initialIndex: 0,
+      );
+      await _player.play();
+    } catch (e) {
+      debugPrint('AudioPlayerService: reshuffle failed: $e');
+    } finally {
+      _isHandlingIndexChange = false;
+    }
+    notifyListeners();
   }
 
   /// Starts or resumes the current source.
@@ -433,19 +608,45 @@ class AudioPlayerService extends ChangeNotifier {
   }
 
   /// Moves to the next track.
+  ///
+  /// Shuffle mode adds two behaviors on top of the regular sequential
+  /// advance:
+  /// 1. The track being left is pushed onto [_playHistory] so a later
+  ///    [skipPrevious] can step back through what the listener really
+  ///    heard, not what's adjacent in the (possibly reshuffled) queue.
+  /// 2. Reaching the end of a shuffled queue with [RepeatMode.all]
+  ///    triggers [_reshuffleAndRestart] instead of just looping the
+  ///    same shuffled order over and over.
   Future<void> skipNext() async {
     if (_queue.isEmpty) return;
 
     final currentIdx = _player.currentIndex ?? 0;
     final isLastTrack = currentIdx >= _queue.length - 1;
 
-    // When repeat is OFF and we're at the last track, do nothing
-    if (repeatMode == RepeatMode.off && isLastTrack) {
-      debugPrint('AudioPlayerService: At last track with repeat OFF - not advancing');
-      return;
+    // Record the current track on the back-stack BEFORE we move off it,
+    // so skipPrevious(shuffle) walks back through actual listening
+    // history. We do this in shuffle mode only — non-shuffle's
+    // back-stack is the queue order itself.
+    if (_shuffleEnabled) {
+      final track = currentTrack;
+      if (track != null) _playHistory.add(track);
     }
 
-    // Update last known index before seeking
+    if (isLastTrack) {
+      if (repeatMode == RepeatMode.all && _shuffleEnabled && _queue.length > 1) {
+        // End of shuffled queue + repeat-all: regenerate fresh random
+        // order and start it from the top.
+        await _reshuffleAndRestart();
+        return;
+      }
+      if (repeatMode == RepeatMode.off) {
+        debugPrint('AudioPlayerService: At last track with repeat OFF - not advancing');
+        return;
+      }
+      // Repeat-all (non-shuffle): just-audio's seekToNext handles the
+      // wrap to index 0.
+    }
+
     if (!isLastTrack) {
       _lastKnownIndex = currentIdx + 1;
     } else if (repeatMode == RepeatMode.all) {
@@ -460,6 +661,14 @@ class AudioPlayerService extends ChangeNotifier {
   }
 
   /// Moves to the previous track.
+  ///
+  /// In shuffle mode, "previous" is the actual back-stack of recently
+  /// played tracks ([_playHistory]) — same as Spotify. The current
+  /// queue order is irrelevant once tracks have been re-randomized,
+  /// so we walk back through what the listener really heard.
+  ///
+  /// Outside shuffle, or when the back-stack is empty (start of the
+  /// shuffle session), we fall through to the engine's seekToPrevious.
   Future<void> skipPrevious() async {
     if (_queue.isEmpty) return;
 
@@ -467,6 +676,25 @@ class AudioPlayerService extends ChangeNotifier {
     if (_player.position.inMilliseconds > 2500) {
       await _player.seek(Duration.zero);
       return;
+    }
+
+    if (_shuffleEnabled && _playHistory.isNotEmpty) {
+      // Pop the most recently played track off the back-stack and seek
+      // to it in the current queue. If for some reason it's no longer
+      // in the queue (shouldn't happen — we keep the same set of tracks
+      // when reshuffling), fall through to the default behavior.
+      final prev = _playHistory.removeLast();
+      final idx = _queue.indexWhere((t) => t.id == prev.id);
+      if (idx >= 0) {
+        // Set _lastKnownIndex BEFORE the seek so the index-stream
+        // listener sees `index == _lastKnownIndex` and skips both the
+        // auto-advance guard and the back-stack auto-push (we're
+        // stepping back, not moving on).
+        _lastKnownIndex = idx;
+        await _player.seek(Duration.zero, index: idx);
+        notifyListeners();
+        return;
+      }
     }
 
     final currentIdx = _player.currentIndex ?? 0;

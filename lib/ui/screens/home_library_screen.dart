@@ -9,7 +9,17 @@ import 'playlist_detail_screen.dart';
 
 /// Main library screen with Tracks/Playlists segmented control.
 class HomeLibraryScreen extends StatefulWidget {
-  const HomeLibraryScreen({super.key});
+  const HomeLibraryScreen({super.key, this.onOpenPlaylist});
+
+  /// Optional callback invoked when the user opens a playlist from the
+  /// "Playlists" tab. When provided (desktop shell), the host swaps its
+  /// body to render [PlaylistDetailScreen] inside its own scaffold so the
+  /// persistent [GlassPlayerBar] stays visible — exactly the same path
+  /// the sidebar uses. When `null` (mobile shell, which uses an
+  /// `IndexedStack` and has no sidebar), the tab falls back to pushing a
+  /// new route; the playlist screen there renders its own
+  /// `MobileMiniPlayer` so the player bar still shows.
+  final ValueChanged<int>? onOpenPlaylist;
 
   @override
   State<HomeLibraryScreen> createState() => _HomeLibraryScreenState();
@@ -162,11 +172,29 @@ class _HomeLibraryScreenState extends State<HomeLibraryScreen> {
                               subtitle: Text('$trackCount tracks'),
                               trailing: const Icon(Icons.chevron_right),
                               onTap: () {
-                                Navigator.of(context).push(
-                                  MaterialPageRoute(
-                                    builder: (_) => PlaylistDetailScreen(playlistId: playlist.id!),
-                                  ),
-                                );
+                                // Unified navigation (BUG FIX): when the
+                                // host (desktop shell) provides a
+                                // callback, route through its state so
+                                // the playlist renders inside the shell
+                                // — same path the sidebar uses, keeping
+                                // the persistent GlassPlayerBar visible
+                                // and the now-playing context scoped to
+                                // the playlist surface. On mobile the
+                                // callback is `null` and we push a new
+                                // route; the pushed screen renders its
+                                // own MobileMiniPlayer.
+                                final cb = widget.onOpenPlaylist;
+                                if (cb != null) {
+                                  cb(playlist.id!);
+                                } else {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => PlaylistDetailScreen(
+                                        playlistId: playlist.id!,
+                                      ),
+                                    ),
+                                  );
+                                }
                               },
                             ),
                           );

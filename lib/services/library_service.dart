@@ -7,7 +7,7 @@ import 'package:path/path.dart' as p;
 import '../database/database_helper.dart';
 import '../models/playlist_model.dart';
 import '../models/track_model.dart';
-import 'windows_shell.dart';
+import 'shell_service.dart';
 
 /// Coordinates SQLite and filesystem operations for the music library UI.
 class LibraryService extends ChangeNotifier {
@@ -206,9 +206,12 @@ class LibraryService extends ChangeNotifier {
     await f.copy(dest);
   }
 
-  /// Opens Explorer focused on the track file.
+  /// Opens the system file manager focused on the track file.
+  ///
+  /// Routes through [ShellService.showInFolder] which uses Explorer on
+  /// Windows, `xdg-open` on Linux, and Finder (`open -R`) on macOS.
   Future<void> revealTrackInExplorer(TrackModel track) async {
-    await WindowsShell.showInFolder(track.filePath);
+    await ShellService.showInFolder(track.filePath);
   }
 
   /// Removes DB row and optionally deletes the file from the library folder.

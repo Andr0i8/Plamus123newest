@@ -102,6 +102,31 @@ class MobileMiniPlayer extends StatelessWidget {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // Shuffle toggle — tints to the accent color when
+                    // active so the user can see at a glance whether
+                    // the queue order is being randomized. Tap is
+                    // consumed locally so it doesn't bubble up to the
+                    // parent GestureDetector and open the full player.
+                    SizedBox(
+                      width: 40,
+                      height: 48,
+                      child: IconButton(
+                        tooltip: audioService.shuffleEnabled
+                            ? 'Shuffle: ON'
+                            : 'Shuffle: OFF',
+                        icon: const Icon(Icons.shuffle),
+                        iconSize: 22,
+                        padding: EdgeInsets.zero,
+                        color: audioService.shuffleEnabled
+                            ? accentColor
+                            : Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: 0.5),
+                        onPressed: () => audioService.toggleShuffle(),
+                      ),
+                    ),
+
                     // Previous button
                     SizedBox(
                       width: 48,

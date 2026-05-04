@@ -1,15 +1,18 @@
 import 'dart:io';
 
-import 'package:flutter/foundation.dart' show FlutterError;
+import 'package:flutter/foundation.dart' show FlutterError, debugPrint;
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+
+import 'plamus_paths.dart';
 
 /// Resolved paths to external CLI tools used by Plamus.
 ///
-/// [ytDlpPath] and [ffmpegPath] point under application support after
+/// [ytDlpPath] and [ffmpegPath] point to executables on disk after
 /// [BinaryService.ensureBinariesExtracted] runs. [errors] lists human-readable
-/// problems (e.g. missing asset) without throwing from the initializer.
+/// problems (e.g. missing asset, no network) without throwing from the
+/// initializer so the rest of the app still starts.
 class BinaryResolution {
   /// Creates a resolution result.
   const BinaryResolution({
@@ -20,13 +23,13 @@ class BinaryResolution {
     this.errors = const [],
   });
 
-  /// Absolute path where `yt-dlp.exe` should live (may be missing).
+  /// Absolute path where `yt-dlp` (or `yt-dlp.exe`) should live (may be missing).
   final String ytDlpPath;
 
-  /// Absolute path where `ffmpeg.exe` should live (may be missing).
+  /// Absolute path where `ffmpeg` (or `ffmpeg.exe`) should live (may be missing).
   final String ffmpegPath;
 
-  /// True when [ytDlpPath] exists and looks like a real executable (> 1 KiB).
+  /// True when [ytDlpPath] exists and looks like a real executable.
   final bool ytDlpAvailable;
 
   /// True when [ffmpegPath] exists and looks like a real executable.
@@ -36,36 +39,78 @@ class BinaryResolution {
   final List<String> errors;
 }
 
-/// Extracts bundled `yt-dlp.exe` and `ffmpeg.exe` from Flutter assets into
-/// the per-user application support directory (Windows: `%AppData%`-style).
+/// Resolves CLI tools (`yt-dlp`, `ffmpeg`) needed by the desktop builds.
 ///
-/// Assets must be declared under `assets/bin/` in `pubspec.yaml`. If an asset
-/// is absent (developer forgot to copy the EXE), the app still starts and
-/// [BinaryResolution.errors] explains what is missing.
+/// **Windows:** extracts bundled `yt-dlp.exe` and `ffmpeg.exe` from Flutter
+/// assets into the per-user application support directory. Assets must be
+/// declared under `assets/bin/` in `pubspec.yaml`.
+///
+/// **Linux:** downloads the latest static `yt-dlp` build from GitHub on
+/// first run into `~/.local/share/plamus/bin/` and `chmod +x`'s it. ffmpeg
+/// is resolved against the system `PATH` (`which ffmpeg`); if missing,
+/// [BinaryResolution.errors] tells the user to install it via their package
+/// manager.
+///
+/// **macOS:** unchanged behavior (uses asset extraction; no maintained build
+/// today, but the API is preserved).
+///
+/// If any binary is absent, the app still starts and [BinaryResolution.errors]
+/// explains what is missing.
 class BinaryService {
   BinaryService._();
 
   static final BinaryService instance = BinaryService._();
 
-  static const String _assetYtDlp = 'assets/bin/yt-dlp.exe';
-  static const String _assetFfmpeg = 'assets/bin/ffmpeg.exe';
+  static const String _assetYtDlpWin = 'assets/bin/yt-dlp.exe';
+  static const String _assetFfmpegWin = 'assets/bin/ffmpeg.exe';
+
+  /// Source for the static Linux yt-dlp build.
+  ///
+  /// The `latest/download/yt-dlp` URL redirects to whichever release is
+  /// current; `Client.send` follows redirects up to [http.Request.maxRedirects].
+  static const String _ytDlpLinuxUrl =
+      'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+
+  /// Cap for the yt-dlp download — we don't want to hang the splash forever.
+  static const Duration _downloadTimeout = Duration(minutes: 5);
 
   BinaryResolution? _cached;
 
   /// Last successful or attempted resolution (null until [ensureBinariesExtracted]).
   BinaryResolution? get lastResolution => _cached;
 
-  /// Copies bundled binaries next to app data if needed and validates sizes.
+  /// Resolves binaries for the current platform.
   ///
-  /// Safe to call on every launch: skips rewrite when the on-disk file already
-  /// matches the embedded asset byte length.
+  /// Safe to call on every launch: existing on-disk binaries are reused and
+  /// only redownloaded / rewritten when they are missing or look invalid.
   ///
-  /// **Desktop-only:** Returns empty resolution on unsupported platforms.
+  /// Returns an empty resolution on unsupported platforms (mobile uses
+  /// `AudioDownloadService` instead).
   Future<BinaryResolution> ensureBinariesExtracted() async {
+    if (Platform.isLinux) {
+      return _cached = await _resolveLinux();
+    }
+    if (Platform.isWindows || Platform.isMacOS) {
+      return _cached = await _resolveBundledAssets();
+    }
+    // Mobile / unknown: caller should not hit this path.
+    return _cached = const BinaryResolution(
+      ytDlpPath: '',
+      ffmpegPath: '',
+      ytDlpAvailable: false,
+      ffmpegAvailable: false,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Windows / macOS: extract bundled assets
+  // ---------------------------------------------------------------------------
+
+  Future<BinaryResolution> _resolveBundledAssets() async {
     final errors = <String>[];
     try {
-      final support = await getApplicationSupportDirectory();
-      final binDir = Directory(p.join(support.path, 'bin'));
+      final supportPath = await PlamusPaths.applicationSupportDirectory();
+      final binDir = Directory(p.join(supportPath, 'bin'));
       if (!await binDir.exists()) {
         await binDir.create(recursive: true);
       }
@@ -74,13 +119,13 @@ class BinaryService {
       final ffTarget = File(p.join(binDir.path, 'ffmpeg.exe'));
 
       await _materializeAssetExecutable(
-        assetPath: _assetYtDlp,
+        assetPath: _assetYtDlpWin,
         target: ytTarget,
         label: 'yt-dlp',
         errors: errors,
       );
       await _materializeAssetExecutable(
-        assetPath: _assetFfmpeg,
+        assetPath: _assetFfmpegWin,
         target: ffTarget,
         label: 'ffmpeg',
         errors: errors,
@@ -100,14 +145,13 @@ class BinaryService {
         );
       }
 
-      _cached = BinaryResolution(
+      return BinaryResolution(
         ytDlpPath: ytTarget.path,
         ffmpegPath: ffTarget.path,
         ytDlpAvailable: ytOk,
         ffmpegAvailable: ffOk,
         errors: List.unmodifiable(errors),
       );
-      return _cached!;
     } catch (e, st) {
       errors.add('Binary extraction failed: $e');
       assert(() {
@@ -115,14 +159,13 @@ class BinaryService {
         print(st);
         return true;
       }());
-      _cached = BinaryResolution(
+      return BinaryResolution(
         ytDlpPath: '',
         ffmpegPath: '',
         ytDlpAvailable: false,
         ffmpegAvailable: false,
         errors: List.unmodifiable(errors),
       );
-      return _cached!;
     }
   }
 
@@ -160,6 +203,148 @@ class BinaryService {
       );
     } catch (e) {
       errors.add('$label: unexpected error loading $assetPath: $e');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Linux: download yt-dlp + use system ffmpeg
+  // ---------------------------------------------------------------------------
+
+  Future<BinaryResolution> _resolveLinux() async {
+    final errors = <String>[];
+    String ytPath = '';
+    bool ytOk = false;
+
+    try {
+      final supportPath = await PlamusPaths.applicationSupportDirectory();
+      final binDir = Directory(p.join(supportPath, 'bin'));
+      if (!await binDir.exists()) {
+        await binDir.create(recursive: true);
+      }
+
+      final ytTarget = File(p.join(binDir.path, 'yt-dlp'));
+      ytPath = ytTarget.path;
+
+      ytOk = await _isPlausibleExecutable(ytTarget);
+      if (!ytOk) {
+        debugPrint('BinaryService: downloading yt-dlp to ${ytTarget.path}');
+        try {
+          await _downloadFile(
+            url: _ytDlpLinuxUrl,
+            target: ytTarget,
+            timeout: _downloadTimeout,
+          );
+          await _chmodPlusX(ytTarget.path);
+          ytOk = await _isPlausibleExecutable(ytTarget);
+          if (!ytOk) {
+            errors.add(
+              'yt-dlp downloaded but does not look like a valid executable '
+              '(${await ytTarget.exists() ? '${await ytTarget.length()} B' : 'missing'}).',
+            );
+          }
+        } catch (e) {
+          errors.add(
+            'Could not download yt-dlp from $_ytDlpLinuxUrl ($e). '
+            'Check your internet connection or place a yt-dlp binary at '
+            '"${ytTarget.path}" manually.',
+          );
+        }
+      } else {
+        // Re-apply chmod +x in case the file lost its execute bit (e.g. a
+        // backup/restore tool stripped permissions).
+        await _chmodPlusX(ytTarget.path);
+      }
+    } catch (e, st) {
+      errors.add('Could not prepare yt-dlp on Linux: $e');
+      assert(() {
+        // ignore: avoid_print
+        print(st);
+        return true;
+      }());
+    }
+
+    final ffmpegResolved = await _findSystemFfmpeg();
+    final ffPath = ffmpegResolved ?? '';
+    final ffOk = ffmpegResolved != null;
+    if (!ffOk) {
+      errors.add(
+        'ffmpeg is not installed. Install it with your package manager:\n'
+        '  Arch: sudo pacman -S ffmpeg\n'
+        '  Ubuntu/Debian: sudo apt install ffmpeg\n'
+        '  Fedora: sudo dnf install ffmpeg',
+      );
+    }
+
+    return BinaryResolution(
+      ytDlpPath: ytPath,
+      ffmpegPath: ffPath,
+      ytDlpAvailable: ytOk,
+      ffmpegAvailable: ffOk,
+      errors: List.unmodifiable(errors),
+    );
+  }
+
+  /// Resolves an `ffmpeg` executable on `PATH`. Returns `null` if not found.
+  static Future<String?> _findSystemFfmpeg() async {
+    try {
+      final result = await Process.run('which', ['ffmpeg']);
+      if (result.exitCode == 0) {
+        final out = (result.stdout as Object?).toString().trim();
+        if (out.isNotEmpty && await File(out).exists()) {
+          return out;
+        }
+      }
+    } catch (_) {
+      // `which` itself missing — extremely rare on Linux but not fatal.
+    }
+    return null;
+  }
+
+  /// Streams [url] to [target] with redirect following and a hard [timeout].
+  static Future<void> _downloadFile({
+    required String url,
+    required File target,
+    required Duration timeout,
+  }) async {
+    final client = http.Client();
+    try {
+      final request = http.Request('GET', Uri.parse(url))
+        ..followRedirects = true
+        ..maxRedirects = 5;
+      final response = await client.send(request).timeout(timeout);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(
+          'HTTP ${response.statusCode} from $url',
+          uri: Uri.parse(url),
+        );
+      }
+      // Write to a temp file first so a partial download never replaces the
+      // existing binary.
+      final tmp = File('${target.path}.part');
+      if (await tmp.exists()) await tmp.delete();
+      final sink = tmp.openWrite();
+      try {
+        await response.stream.pipe(sink);
+      } catch (e) {
+        await sink.close().catchError((_) {});
+        if (await tmp.exists()) await tmp.delete();
+        rethrow;
+      }
+      // pipe() closes the sink when the stream completes successfully.
+      if (await target.exists()) await target.delete();
+      await tmp.rename(target.path);
+    } finally {
+      client.close();
+    }
+  }
+
+  /// Best-effort `chmod +x` on POSIX systems. Silently skips on Windows.
+  static Future<void> _chmodPlusX(String path) async {
+    if (Platform.isWindows) return;
+    try {
+      await Process.run('chmod', ['+x', path]);
+    } catch (e) {
+      debugPrint('BinaryService: chmod +x failed for $path: $e');
     }
   }
 
