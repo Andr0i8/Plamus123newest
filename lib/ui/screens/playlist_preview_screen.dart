@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -10,7 +9,6 @@ import '../../services/plamus_paths.dart';
 import '../../services/track_download_helper.dart';
 import '../../services/youtube_playlist_service.dart';
 import '../widgets/glass_player_bar.dart';
-import '../widgets/mobile_mini_player.dart';
 
 /// Per-track download status used to drive the row state badge in the
 /// playlist preview screen.
@@ -173,10 +171,15 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
   // ---------------------------------------------------------------------------
 
   /// Sequentially downloads every track in [_info]. Sequential because:
-  ///   * desktop's [DownloadService] picks the most recently modified
-  ///     `.mp3` in the output dir as its result, so two parallel runs
-  ///     would race for the same heuristic;
+  ///   * `DownloadService` resolves the on-disk path via stdout from
+  ///     yt-dlp's `--print after_move:filepath`, but the legacy
+  ///     mtime-based fallback can't disambiguate two writes that race
+  ///     into the same directory;
   ///   * we want the UI to show one active track at a time anyway.
+  ///
+  /// Per-track failures are caught, logged, and surfaced as a "Failed"
+  /// badge — the loop ALWAYS continues so a single bad video (private,
+  /// region-locked, removed) doesn't strand the rest of the playlist.
   Future<void> _downloadAll() async {
     final info = _info;
     if (info == null || info.tracks.isEmpty || _downloading) return;
@@ -187,10 +190,13 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
 
     // Resolve the destination picker selection into a concrete target
     // playlist id. All three destinations share the same per-track
-    // download loop below; the only difference is whether
-    // `plamusPlaylistId` is non-null and therefore used to call
-    // [LibraryService.addTrackToPlaylist] for each track.
+    // download loop below; the only differences are whether
+    // `plamusPlaylistId` is non-null (drives the
+    // [LibraryService.addTrackToPlaylist] call per track) and whether
+    // each track's library row is hidden from the main library view
+    // (`saveToLibrary`).
     int? plamusPlaylistId;
+    bool saveToLibrary;
     switch (_destination) {
       case _Destination.newPlaylist:
         // If the title is empty, fall back to a generic name with the
@@ -206,6 +212,11 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
             SnackBar(content: Text('Could not create playlist: $e')),
           );
         }
+        // A freshly-created playlist is the user's primary container
+        // for this batch, so the tracks should live ONLY there. They
+        // remain reachable from the playlist screen itself; the main
+        // library view stays uncluttered.
+        saveToLibrary = false;
       case _Destination.existingPlaylist:
         // Use the same derivation that drove the dropdown UI so the
         // target matches what the user saw. The derivation falls back
@@ -216,6 +227,13 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
         final effective = _effectiveExistingId(lib.playlists);
         if (effective != null) {
           plamusPlaylistId = effective;
+          // The user explicitly picked an existing playlist as the
+          // destination. Per the spec, the tracks should land ONLY in
+          // that playlist and not also be appended to the general
+          // library. `inLibrary: false` flips the library-list flag on
+          // each new row so the track is reachable strictly from the
+          // chosen playlist.
+          saveToLibrary = false;
         } else {
           messenger.showSnackBar(
             const SnackBar(
@@ -225,11 +243,12 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
               ),
             ),
           );
+          saveToLibrary = true;
         }
       case _Destination.library:
         // `plamusPlaylistId` stays null: tracks are only registered in
         // the library and never linked to any playlist.
-        break;
+        saveToLibrary = true;
     }
 
     if (!mounted) return;
@@ -244,57 +263,86 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
     for (var i = 0; i < info.tracks.length; i++) {
       if (_cancelled || !mounted) break;
 
-      final track = info.tracks[i];
-      setState(() {
-        _currentFraction = 0;
-        _trackStatus[track.id] = _TrackStatus.downloading;
-      });
-
+      // Wrap the entire iteration body so NOTHING — not even a stray
+      // setState during a rebuild race — can break the loop. This is
+      // critical for big playlists where a transient error on one
+      // track must not strand the remaining 99% of the queue.
       try {
-        final result = await TrackDownloadHelper.download(
-          url: track.url,
-          libraryDirectory: root,
-          onProgress: (fraction, _) {
-            if (!mounted) return;
-            setState(() => _currentFraction = fraction);
-          },
-        );
+        final track = info.tracks[i];
 
-        // Register in the library and link into the corresponding
-        // Plamus playlist (when we successfully created one).
-        final trackId = await lib.registerTrackFile(
-          result.filePath,
-          // Prefer server-provided metadata; fall back to the playlist's
-          // own title/channel since they're already known and tend to be
-          // cleaner than yt-dlp-derived filenames.
-          title: result.title?.isNotEmpty == true ? result.title : track.title,
-          artist:
-              result.artist?.isNotEmpty == true ? result.artist : track.channel,
-          sourceUrl: track.url,
-        );
-        if (plamusPlaylistId != null) {
-          await lib.addTrackToPlaylist(plamusPlaylistId, trackId);
+        if (mounted) {
+          setState(() {
+            _currentFraction = 0;
+            _trackStatus[track.id] = _TrackStatus.downloading;
+          });
         }
-        if (!mounted) return;
-        setState(() {
-          _trackStatus[track.id] = _TrackStatus.done;
-          _completed++;
-        });
-      } catch (e) {
-        // Continue with the next track instead of aborting. Real-world
-        // playlists frequently contain age-restricted / region-locked
-        // / private videos that fail server-side or in yt-dlp.
-        if (!mounted) return;
-        setState(() {
-          _trackStatus[track.id] = _TrackStatus.failed;
-          _failed++;
-        });
-        debugPrint('Download failed for ${track.url}: $e');
+
+        try {
+          final result = await TrackDownloadHelper.download(
+            url: track.url,
+            libraryDirectory: root,
+            onProgress: (fraction, _) {
+              if (!mounted) return;
+              setState(() => _currentFraction = fraction);
+            },
+          );
+
+          // Register in the library and link into the corresponding
+          // Plamus playlist (when we have a destination playlist).
+          // `inLibrary` follows the destination semantics derived
+          // above: only the explicit "Add to library" destination
+          // surfaces tracks in the main library list.
+          final trackId = await lib.registerTrackFile(
+            result.filePath,
+            // Prefer server-provided metadata; fall back to the
+            // playlist's own title/channel since they tend to be
+            // cleaner than yt-dlp-derived filenames.
+            title:
+                result.title?.isNotEmpty == true ? result.title : track.title,
+            artist: result.artist?.isNotEmpty == true
+                ? result.artist
+                : track.channel,
+            sourceUrl: track.url,
+            artworkPath: result.artworkPath,
+            inLibrary: saveToLibrary,
+          );
+          if (plamusPlaylistId != null) {
+            await lib.addTrackToPlaylist(plamusPlaylistId, trackId);
+          }
+
+          if (!mounted) break;
+          setState(() {
+            _trackStatus[track.id] = _TrackStatus.done;
+            _completed++;
+          });
+        } catch (e, st) {
+          // Real-world playlists routinely contain age-restricted /
+          // region-locked / removed videos. Each failure must be
+          // contained so the loop continues with the next URL.
+          debugPrint('Playlist download failed for ${track.url}: $e\n$st');
+          if (!mounted) break;
+          setState(() {
+            _trackStatus[track.id] = _TrackStatus.failed;
+            _failed++;
+          });
+        }
+      } catch (e, st) {
+        // Last-resort guard for anything that escaped the inner try
+        // (setState exceptions during a rebuild race, framework
+        // asserts, …). Log it and keep iterating — the user will see
+        // failed badges and the summary at the end.
+        debugPrint('Playlist iteration crashed: $e\n$st');
+        if (!mounted) break;
       }
     }
 
     if (!mounted) return;
-    await lib.refreshAll();
+    try {
+      await lib.refreshAll();
+    } catch (_) {
+      // Library refresh failure is non-fatal; the playlist screen
+      // still renders the per-track badges and the summary below.
+    }
     if (!mounted) return;
     setState(() {
       _downloading = false;
@@ -320,7 +368,6 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final isMobile = Platform.isAndroid || Platform.isIOS;
     return Scaffold(
       appBar: AppBar(
         leading: const BackButton(),
@@ -330,13 +377,11 @@ class _PlaylistPreviewScreenState extends State<PlaylistPreviewScreen> {
           overflow: TextOverflow.ellipsis,
         ),
       ),
-      // Persistent bottom player. The screen is always pushed as a route
-      // (covering the shell on desktop and any host dialog on mobile), so
-      // we render the platform's player UI here so playback controls
-      // never disappear during the preview / download phase. Mirrors the
-      // same defensive fallback used by PlaylistDetailScreen (BUG 7).
-      bottomNavigationBar:
-          isMobile ? const MobileMiniPlayer() : const GlassPlayerBar(),
+      // Persistent bottom player. The screen is always pushed as a
+      // route (covering the shell), so we render the player UI here so
+      // playback controls never disappear during the preview /
+      // download phase.
+      bottomNavigationBar: const GlassPlayerBar(),
       body: FutureBuilder<YoutubePlaylistInfo>(
         future: _future,
         builder: (context, snapshot) {

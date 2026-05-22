@@ -1,27 +1,26 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io' show HttpException;
 
 import 'package:flutter/foundation.dart' show debugPrint;
-import 'package:http/http.dart' as http;
+
+import 'youtube_api.dart';
 
 /// Whether a [YoutubeSearchResult] points at a single video or a playlist
 /// of videos. Drives both the tile UI (duration vs. track count) and the
 /// tap behavior (direct download vs. open the preview screen).
 enum YoutubeSearchKind { video, playlist }
 
-/// One row in a search response from the Plamus extraction server.
+/// One row in a YouTube search response.
 ///
-/// The server can return either of:
-///   * `type: "video"` — single video with `duration_seconds`. Tapping it
+/// Two flavors:
+///   * `kind: video` — single video with [durationSeconds]. Tapping it
 ///     downloads via the existing per-track pipeline.
-///   * `type: "playlist"` — playlist with `track_count`. Tapping opens a
+///   * `kind: playlist` — playlist with [trackCount]. Tapping opens a
 ///     preview screen that lists the playlist's tracks (fetched lazily
-///     from the `/playlist` endpoint) and offers "Download all".
+///     by [YoutubePlaylistService]) and offers "Download all".
 ///
-/// All response fields are parsed defensively — missing or unexpected
-/// values default to a benign "video with unknown duration", so an older
-/// server build (pre-playlist support) still produces working video rows.
+/// The shape mirrors the historical Plamus server response so existing
+/// UI code in the import panel and the playlist preview screen keeps
+/// working unchanged.
 class YoutubeSearchResult {
   /// Creates an immutable search result.
   const YoutubeSearchResult({
@@ -47,121 +46,262 @@ class YoutubeSearchResult {
   /// Channel / uploader name with HTML entities already decoded.
   final String channel;
 
-  /// Direct URL to the YouTube thumbnail (typically `mqdefault.jpg`).
+  /// Direct URL to the YouTube thumbnail (typically `mqdefault.jpg` or
+  /// the highest-resolution variant the API surfaced).
   final String thumbnail;
 
   /// Full URL — `https://www.youtube.com/watch?v=…` for videos,
-  /// `https://www.youtube.com/playlist?list=…` for playlists. The video
-  /// form feeds straight into the existing yt-dlp / extractor download
-  /// pipeline; the playlist form is forwarded to the `/playlist` endpoint
-  /// to enumerate its tracks.
+  /// `https://www.youtube.com/playlist?list=…` for playlists.
   final String url;
 
-  /// Length of the video in seconds. `0` when unknown (older server) or
-  /// when [kind] is [YoutubeSearchKind.playlist].
+  /// Length of the video in seconds. `0` when unknown (live stream,
+  /// region-locked) or when [kind] is [YoutubeSearchKind.playlist].
   final int durationSeconds;
 
-  /// Number of videos in the playlist. `0` when unknown or when [kind] is
-  /// [YoutubeSearchKind.video].
+  /// Number of videos in the playlist. `0` when unknown or when [kind]
+  /// is [YoutubeSearchKind.video].
   final int trackCount;
 
   /// Convenience accessors so call sites read nicely.
   bool get isVideo => kind == YoutubeSearchKind.video;
   bool get isPlaylist => kind == YoutubeSearchKind.playlist;
-
-  /// Builds a result from a single JSON object.
-  ///
-  /// Defaults [kind] to [YoutubeSearchKind.video] when `type` is missing
-  /// so we stay compatible with the pre-playlist server build.
-  factory YoutubeSearchResult.fromJson(Map<String, dynamic> json) {
-    final rawType = (json['type'] ?? '').toString().toLowerCase();
-    final kind = rawType == 'playlist'
-        ? YoutubeSearchKind.playlist
-        : YoutubeSearchKind.video;
-    return YoutubeSearchResult(
-      kind: kind,
-      id: (json['id'] ?? '').toString(),
-      title: _decodeHtmlEntities((json['title'] ?? '').toString()),
-      channel: _decodeHtmlEntities((json['channel'] ?? '').toString()),
-      thumbnail: (json['thumbnail'] ?? '').toString(),
-      url: (json['url'] ?? '').toString(),
-      durationSeconds: _readInt(json['duration_seconds']),
-      trackCount: _readInt(json['track_count']),
-    );
-  }
 }
 
-/// Thin client for the Plamus Railway search endpoint.
+/// Pure-Dart YouTube search backed by the Data API v3.
 ///
-/// `GET https://web-production-1bab4.up.railway.app/search?q=<query>` →
-/// ```json
-/// { "results": [
-///     { "type": "video",    "id", "title", "channel", "thumbnail",
-///       "url", "duration_seconds" },
-///     { "type": "playlist", "id", "title", "channel", "thumbnail",
-///       "url", "track_count" },
-///     …
-///   ] }
-/// ```
+/// `search.list` returns mixed video + playlist hits but does NOT carry
+/// per-item durations or playlist track counts; we batch-fetch those
+/// via `videos.list` (durations) and `playlists.list` (item counts) so
+/// the UI can render the same `<title> · <duration | N tracks>` rows
+/// the Plamus design has always shown.
 ///
-/// Same Railway instance that handles `/download` for mobile and
-/// `/playlist` for full playlist listings (see [YoutubePlaylistService]).
+/// Same code runs on every platform — Linux, Windows, Android. The
+/// search request itself is independent of the per-platform download
+/// pipeline (yt-dlp on desktop, Cobalt on Android).
 class YoutubeSearchService {
   YoutubeSearchService._();
 
-  /// Production server. Hard-coded to match `YoutubeDownloadService`.
-  static const String _serverUrl =
-      'https://web-production-1bab4.up.railway.app';
-
-  /// Cap so a slow server can never freeze the search field forever.
+  /// Hard cap so a slow API call cannot freeze the search field forever.
   static const Duration _timeout = Duration(seconds: 15);
 
-  /// Searches YouTube via the Plamus server and returns parsed results.
+  /// Number of search hits per query. The Data API caps this at 50, but
+  /// the UI only paints the first 25-ish before the user re-types, so
+  /// 25 is a reasonable balance between recall and quota cost.
+  static const int _maxResults = 25;
+
+  /// Searches YouTube via the Data API and returns parsed results.
   ///
-  /// Returns an empty list when [query] is blank — callers should treat that
-  /// as "no search performed" rather than "no matches".
+  /// Returns an empty list when [query] is blank — callers should treat
+  /// that as "no search performed" rather than "no matches".
   ///
-  /// Throws on network / server errors so the caller can surface a
+  /// Throws on network / quota / API errors so the caller can surface a
   /// "Search unavailable" message.
   static Future<List<YoutubeSearchResult>> search(String query) async {
     final trimmed = query.trim();
     if (trimmed.isEmpty) return const [];
 
-    final uri = Uri.parse('$_serverUrl/search').replace(
-      queryParameters: {'q': trimmed},
+    // Step 1: hit search.list for the mixed video + playlist hits.
+    final searchResponse = await YoutubeApi.get(
+      'search',
+      {
+        'part': 'snippet',
+        'q': trimmed,
+        'type': 'video,playlist',
+        'maxResults': '$_maxResults',
+        'safeSearch': 'none',
+      },
+      timeout: _timeout,
     );
 
-    final response = await http.get(uri).timeout(_timeout);
-
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpException(
-        'Search server returned ${response.statusCode}',
-        uri: uri,
-      );
-    }
-
-    final dynamic decoded;
-    try {
-      decoded = jsonDecode(utf8.decode(response.bodyBytes));
-    } on FormatException catch (e) {
-      throw StateError('Search server returned invalid JSON: ${e.message}');
-    }
-
-    if (decoded is! Map<String, dynamic>) {
-      throw StateError('Search response is not a JSON object');
-    }
-    final raw = decoded['results'];
-    if (raw is! List) {
-      // Server returned something like `{"error": "..."}` — treat as empty.
-      debugPrint('YoutubeSearchService: missing "results" array in $decoded');
+    final items = searchResponse['items'];
+    if (items is! List || items.isEmpty) {
       return const [];
     }
 
-    return raw
-        .whereType<Map<String, dynamic>>()
-        .map(YoutubeSearchResult.fromJson)
-        .where((r) => r.id.isNotEmpty && r.url.isNotEmpty)
+    // Step 2: walk the search hits, keep ordering, and remember which
+    // ids we'll need to enrich with durations / track counts.
+    final ordered = <_RawHit>[];
+    final videoIds = <String>[];
+    final playlistIds = <String>[];
+
+    for (final raw in items) {
+      if (raw is! Map<String, dynamic>) continue;
+      final hit = _RawHit.tryParse(raw);
+      if (hit == null) continue;
+      ordered.add(hit);
+      if (hit.kind == YoutubeSearchKind.video) {
+        videoIds.add(hit.id);
+      } else {
+        playlistIds.add(hit.id);
+      }
+    }
+
+    if (ordered.isEmpty) return const [];
+
+    // Step 3: parallel batch fetches for the metadata the search call
+    // didn't include. Each request is independent; running them in
+    // parallel cuts latency roughly in half compared to sequential.
+    final results = await Future.wait([
+      _fetchVideoDurations(videoIds),
+      _fetchPlaylistCounts(playlistIds),
+    ]);
+    final durations = results[0];
+    final counts = results[1];
+
+    // Step 4: rebuild in original search order with the enriched data.
+    return ordered
+        .map(
+          (hit) => YoutubeSearchResult(
+            kind: hit.kind,
+            id: hit.id,
+            title: hit.title,
+            channel: hit.channel,
+            thumbnail: hit.thumbnail,
+            url: hit.url,
+            durationSeconds: hit.kind == YoutubeSearchKind.video
+                ? (durations[hit.id] ?? 0)
+                : 0,
+            trackCount: hit.kind == YoutubeSearchKind.playlist
+                ? (counts[hit.id] ?? 0)
+                : 0,
+          ),
+        )
         .toList(growable: false);
+  }
+
+  /// Batched `videos.list?part=contentDetails&id=…` request. Returns a
+  /// map of video id → duration in seconds. Empty when [ids] is empty.
+  static Future<Map<String, int>> _fetchVideoDurations(
+    List<String> ids,
+  ) async {
+    if (ids.isEmpty) return const {};
+    final result = <String, int>{};
+    for (final chunk in chunkIds(ids)) {
+      try {
+        final response = await YoutubeApi.get(
+          'videos',
+          {
+            'part': 'contentDetails',
+            'id': chunk.join(','),
+            'maxResults': '${chunk.length}',
+          },
+          timeout: _timeout,
+        );
+        final items = response['items'];
+        if (items is! List) continue;
+        for (final raw in items) {
+          if (raw is! Map<String, dynamic>) continue;
+          final id = raw['id']?.toString() ?? '';
+          if (id.isEmpty) continue;
+          final details = raw['contentDetails'];
+          final iso = (details is Map ? details['duration'] : null)?.toString();
+          if (iso == null) continue;
+          result[id] = parseIso8601DurationSeconds(iso);
+        }
+      } catch (e) {
+        // Search results are still useful without per-row durations —
+        // log and skip rather than failing the whole search.
+        debugPrint('YoutubeSearchService: video duration batch failed: $e');
+      }
+    }
+    return result;
+  }
+
+  /// Batched `playlists.list?part=contentDetails&id=…` request. Returns
+  /// a map of playlist id → item count. Empty when [ids] is empty.
+  static Future<Map<String, int>> _fetchPlaylistCounts(
+    List<String> ids,
+  ) async {
+    if (ids.isEmpty) return const {};
+    final result = <String, int>{};
+    for (final chunk in chunkIds(ids)) {
+      try {
+        final response = await YoutubeApi.get(
+          'playlists',
+          {
+            'part': 'contentDetails',
+            'id': chunk.join(','),
+            'maxResults': '${chunk.length}',
+          },
+          timeout: _timeout,
+        );
+        final items = response['items'];
+        if (items is! List) continue;
+        for (final raw in items) {
+          if (raw is! Map<String, dynamic>) continue;
+          final id = raw['id']?.toString() ?? '';
+          if (id.isEmpty) continue;
+          final details = raw['contentDetails'];
+          final count = parseYoutubeInt(
+            details is Map ? details['itemCount'] : null,
+          );
+          result[id] = count;
+        }
+      } catch (e) {
+        debugPrint('YoutubeSearchService: playlist count batch failed: $e');
+      }
+    }
+    return result;
+  }
+}
+
+/// Internal struct: the parts of a `search.list` hit we can extract
+/// without any follow-up calls.
+class _RawHit {
+  const _RawHit({
+    required this.kind,
+    required this.id,
+    required this.title,
+    required this.channel,
+    required this.thumbnail,
+    required this.url,
+  });
+
+  final YoutubeSearchKind kind;
+  final String id;
+  final String title;
+  final String channel;
+  final String thumbnail;
+  final String url;
+
+  /// Builds a [_RawHit] from a single `items[]` entry, returning `null`
+  /// for shapes the renderer can't consume (channel hits, missing ids).
+  static _RawHit? tryParse(Map<String, dynamic> raw) {
+    final idObj = raw['id'];
+    if (idObj is! Map) return null;
+    final kindStr = idObj['kind']?.toString() ?? '';
+
+    final YoutubeSearchKind kind;
+    final String id;
+    final String url;
+
+    if (kindStr == 'youtube#video') {
+      kind = YoutubeSearchKind.video;
+      id = idObj['videoId']?.toString() ?? '';
+      url = id.isEmpty ? '' : 'https://www.youtube.com/watch?v=$id';
+    } else if (kindStr == 'youtube#playlist') {
+      kind = YoutubeSearchKind.playlist;
+      id = idObj['playlistId']?.toString() ?? '';
+      url = id.isEmpty ? '' : 'https://www.youtube.com/playlist?list=$id';
+    } else {
+      // Channel hits and other kinds are ignored — we only render
+      // playable content in the search UI.
+      return null;
+    }
+
+    if (id.isEmpty) return null;
+
+    final snippet = raw['snippet'];
+    if (snippet is! Map) return null;
+
+    return _RawHit(
+      kind: kind,
+      id: id,
+      title: decodeYoutubeText(snippet['title']?.toString() ?? ''),
+      channel: decodeYoutubeText(snippet['channelTitle']?.toString() ?? ''),
+      thumbnail: pickThumbnailUrl(snippet['thumbnails']),
+      url: url,
+    );
   }
 }
 
@@ -199,10 +339,10 @@ const Map<String, String> _namedHtmlEntities = {
 
 /// Decodes the most common HTML entities found in YouTube titles.
 ///
-/// Handles named entities (`&amp;`, `&quot;`, …) and numeric ones
-/// (`&#39;`, `&#x2019;`). Leaves unknown entities untouched rather than
-/// throwing — search is non-critical and we'd rather show a slightly ugly
-/// title than no title at all.
+/// The Data API v3 mostly returns clean UTF-8 strings, but some titles
+/// (particularly older uploads) still come through with `&amp;` /
+/// `&#39;` etc. Decoding here is a no-op for clean strings and keeps
+/// the UI safe from raw entity bleed-through.
 String _decodeHtmlEntities(String input) {
   if (!input.contains('&')) return input;
   return input.replaceAllMapped(

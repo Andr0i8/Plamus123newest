@@ -1,7 +1,7 @@
 name: plamus
 description: >
-  Plamus — offline-first music player with library management,
-  remote YouTube audio extraction, and premium minimalist UI.
+  Plamus — offline-first music player with library management and
+  YouTube audio extraction (yt-dlp). Targets Linux and Windows desktop.
 publish_to: "none"
 version: 1.0.0+1
 
@@ -12,32 +12,26 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Audio engine (cross-platform with media_kit backend for desktop).
+  # Audio engine: just_audio + media_kit backend (Linux/Windows desktop).
   just_audio: ^0.9.42
   just_audio_media_kit: ^2.1.0
-  just_audio_background: ^0.0.1-beta.14
-  audio_session: ^0.1.21
 
   # Desktop-only audio libs (Windows/Linux).
-  # These are no-ops on Android — the plugin's native code is excluded
-  # by Flutter's platform detection during build.
   media_kit_libs_windows_audio: any
   media_kit_libs_linux: any
 
-  # SQLite: desktop uses sqflite_common_ffi, mobile uses sqflite.
+  # SQLite via FFI (desktop). The non-FFI sqflite plugin is no longer
+  # needed because we no longer build for Android/iOS.
   sqflite_common_ffi: ^2.3.4
   sqflite_common: ^2.5.4
-  sqflite: ^2.3.0
   path: ^1.9.0
 
   # Paths and file picking.
   path_provider: ^2.1.4
   file_picker: ^8.1.4
 
-  # Mobile permissions.
-  permission_handler: ^11.3.0
-
-  # HTTP client used by AudioDownloadService for direct URL downloads.
+  # HTTP client used by YouTube API + artwork fetcher + first-run yt-dlp
+  # download on Linux.
   http: ^1.2.0
 
   # Icons — tree-shaken automatically in release builds.
@@ -46,10 +40,10 @@ dependencies:
   # State management for player, library, and theme-driven rebuilds.
   provider: ^6.1.2
 
-  # Drag-and-drop for the import modal (desktop only; no-op on Android).
+  # Drag-and-drop for the import modal (desktop only).
   desktop_drop: ^0.4.4
 
-  # Window management for fullscreen mode (desktop only; no-op on Android).
+  # Window management for fullscreen mode and Linux frameless window.
   window_manager: ^0.4.3
 
   cupertino_icons: ^1.0.8
@@ -65,11 +59,7 @@ flutter:
   uses-material-design: true
 
   # Desktop CLI tools: yt-dlp.exe and ffmpeg.exe for Windows/Linux builds.
-  # These MUST be removed or replaced with tiny placeholders when building
-  # for Android to avoid bloating the APK by ~150 MB.
-  #
-  # For Android-only builds, comment out or remove this assets section.
-  # For multi-platform builds, keep but ensure assets/bin/ only contains
-  # a README (real binaries added per-platform before desktop release).
+  # Linux downloads yt-dlp on first run and uses system ffmpeg, so
+  # binaries are only required for Windows.
   assets:
     - assets/bin/

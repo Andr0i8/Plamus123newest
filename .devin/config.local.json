@@ -36,7 +36,19 @@
       "Exec(xdotool search)",
       "Exec(pgrep)",
       "Exec(git log)",
-      "Exec(stat)"
+      "Exec(stat)",
+      "Exec(curl)",
+      "Exec(dart pub)",
+      "Exec(ffprobe)",
+      "Exec(file)",
+      "Exec(git show)",
+      "Exec(readelf)",
+      "Exec(tar)",
+      "Exec(true)",
+      "Exec($ANDROID_HOME/build-tools/*/aapt dump)",
+      "Exec($ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | tail -1)/aapt dump)",
+      "Exec($ANDROID_HOME/platform-tools/adb devices)",
+      "Exec(sha256sum)"
     ]
   }
 }

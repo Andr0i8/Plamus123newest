@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../database/database_helper.dart';
+import '../../models/track_model.dart';
 import '../../services/library_service.dart';
 import '../widgets/import_modal.dart';
+import '../widgets/library_search_field.dart';
 import '../widgets/track_tile.dart';
 import 'playlist_detail_screen.dart';
 
@@ -15,10 +17,7 @@ class HomeLibraryScreen extends StatefulWidget {
   /// "Playlists" tab. When provided (desktop shell), the host swaps its
   /// body to render [PlaylistDetailScreen] inside its own scaffold so the
   /// persistent [GlassPlayerBar] stays visible — exactly the same path
-  /// the sidebar uses. When `null` (mobile shell, which uses an
-  /// `IndexedStack` and has no sidebar), the tab falls back to pushing a
-  /// new route; the playlist screen there renders its own
-  /// `MobileMiniPlayer` so the player bar still shows.
+  /// the sidebar uses.
   final ValueChanged<int>? onOpenPlaylist;
 
   @override
@@ -28,11 +27,42 @@ class HomeLibraryScreen extends StatefulWidget {
 class _HomeLibraryScreenState extends State<HomeLibraryScreen> {
   int _selectedSegment = 0; // 0 = Tracks, 1 = Playlists
 
+  /// Drives the live search field. Persists across rebuilds so the
+  /// query survives Provider notifications.
+  final TextEditingController _searchCtrl = TextEditingController();
+
+  /// Lowercased trimmed copy of [_searchCtrl.text] cached on every
+  /// keystroke. Compared against the lowercased title / artist of each
+  /// track so the filter is case-insensitive without re-lowercasing on
+  /// every list element.
+  String _searchQuery = '';
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  /// Filters [tracks] by the current search query (title + artist,
+  /// case-insensitive substring match). Returns the original list when
+  /// the search box is empty, matching the "show everything by
+  /// default" UX requirement.
+  List<TrackModel> _filteredTracks(List<TrackModel> tracks) {
+    if (_searchQuery.isEmpty) return tracks;
+    return tracks.where((t) {
+      final title = t.title.toLowerCase();
+      final artist = t.displayArtistLabel.toLowerCase();
+      return title.contains(_searchQuery) || artist.contains(_searchQuery);
+    }).toList(growable: false);
+  }
+
   @override
   Widget build(BuildContext context) {
     final lib = context.watch<LibraryService>();
-    final tracks = lib.tracks;
+    final allTracks = lib.tracks;
+    final tracks = _filteredTracks(allTracks);
     final playlists = lib.playlists;
+    final showingTracks = _selectedSegment == 0;
 
     return Scaffold(
       body: CustomScrollView(
@@ -100,14 +130,34 @@ class _HomeLibraryScreenState extends State<HomeLibraryScreen> {
                       ],
                     ),
                   ),
+                  // Live search field — only shown when the library has
+                  // tracks to filter (no point rendering it for an
+                  // empty library, and it would push the empty-state
+                  // message further down for no reason). Hidden when
+                  // the user is browsing playlists; playlists are
+                  // first-class containers and the requirement only
+                  // asks for track-search in the library + per-playlist
+                  // screens.
+                  if (showingTracks && allTracks.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    LibrarySearchField(
+                      controller: _searchCtrl,
+                      onChanged: (value) {
+                        final normalized = value.trim().toLowerCase();
+                        if (normalized == _searchQuery) return;
+                        setState(() => _searchQuery = normalized);
+                      },
+                      hintText: 'Search tracks',
+                    ),
+                  ],
                 ],
               ),
             ),
           ),
           // Content based on selected segment
-          if (_selectedSegment == 0) ...[
+          if (showingTracks) ...[
             // Tracks view
-            if (tracks.isEmpty)
+            if (allTracks.isEmpty)
               SliverFillRemaining(
                 hasScrollBody: false,
                 child: Center(
@@ -118,6 +168,28 @@ class _HomeLibraryScreenState extends State<HomeLibraryScreen> {
                   ),
                 ),
               )
+            else if (tracks.isEmpty)
+              // Library has tracks, but none match the search filter.
+              // Keep the search field interactive (no full-screen
+              // takeover) by using a small inline message instead of a
+              // SliverFillRemaining empty state.
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(32, 48, 32, 48),
+                  child: Center(
+                    child: Text(
+                      'No tracks match "${_searchCtrl.text}".',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: 0.7),
+                          ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ),
+              )
             else
               SliverList(
                 delegate: SliverChildBuilderDelegate(
@@ -125,6 +197,10 @@ class _HomeLibraryScreenState extends State<HomeLibraryScreen> {
                     final t = tracks[i];
                     return TrackTile(
                       track: t,
+                      // Use the FILTERED list as the playback context
+                      // so "play" / next / previous walk through the
+                      // currently-visible rows in the same order the
+                      // user sees them.
                       contextTracks: tracks,
                       contextId: 'library',
                       onRenamed: () => lib.refreshTracks(),
@@ -183,17 +259,15 @@ class _HomeLibraryScreenState extends State<HomeLibraryScreen> {
                               subtitle: Text('$trackCount tracks'),
                               trailing: const Icon(Icons.chevron_right),
                               onTap: () {
-                                // Unified navigation (BUG FIX): when the
-                                // host (desktop shell) provides a
+                                // Unified navigation (BUG FIX): when
+                                // the host (desktop shell) provides a
                                 // callback, route through its state so
-                                // the playlist renders inside the shell
-                                // — same path the sidebar uses, keeping
-                                // the persistent GlassPlayerBar visible
-                                // and the now-playing context scoped to
-                                // the playlist surface. On mobile the
-                                // callback is `null` and we push a new
-                                // route; the pushed screen renders its
-                                // own MobileMiniPlayer.
+                                // the playlist renders inside the
+                                // shell — same path the sidebar uses,
+                                // keeping the persistent
+                                // GlassPlayerBar visible and the
+                                // now-playing context scoped to the
+                                // playlist surface.
                                 final cb = widget.onOpenPlaylist;
                                 if (cb != null) {
                                   cb(playlist.id!);
@@ -300,3 +374,5 @@ class _SegmentButton extends StatelessWidget {
     );
   }
 }
+
+

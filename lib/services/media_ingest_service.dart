@@ -8,8 +8,8 @@ import 'binary_service.dart';
 
 /// Handles local file import: copy audio files into the library folder.
 ///
-/// On Android/iOS, only audio files are supported (no video transcoding).
-/// On desktop, video containers are passed through ffmpeg to extract audio.
+/// Linux/Windows-only. Video containers are passed through ffmpeg to
+/// extract audio.
 class MediaIngestService {
   MediaIngestService._();
 
@@ -54,9 +54,11 @@ class MediaIngestService {
       final appData = Platform.environment['APPDATA'];
       if (appData == null) throw StateError('APPDATA not found');
       return p.join(appData, 'Plamus', 'library');
-    } else if (Platform.isLinux) {
-      // Match PlamusPaths.applicationSupportDirectory() — lowercase to follow
-      // the XDG convention and the documented `~/.local/share/plamus/` spec.
+    }
+    if (Platform.isLinux) {
+      // Match PlamusPaths.applicationSupportDirectory() — lowercase to
+      // follow the XDG convention and the documented
+      // `~/.local/share/plamus/` spec.
       final xdg = Platform.environment['XDG_DATA_HOME'];
       final home = Platform.environment['HOME'];
       final base = (xdg != null && xdg.isNotEmpty)
@@ -68,14 +70,10 @@ class MediaIngestService {
         throw StateError('HOME or XDG_DATA_HOME not set');
       }
       return p.join(base, 'plamus', 'library');
-    } else if (Platform.isMacOS) {
-      final home = Platform.environment['HOME'];
-      if (home == null) throw StateError('HOME not found');
-      return p.join(
-          home, 'Library', 'Application Support', 'Plamus', 'library');
     }
-    // Android/iOS: let callers use PlamusPaths instead.
-    throw UnsupportedError('Use PlamusPaths.musicLibraryDirectory() on mobile');
+    throw UnsupportedError(
+      'Plamus only supports Linux and Windows desktop builds.',
+    );
   }
 
   /// Imports [sourcePath] into [libraryDirectory], returns final audio path.
@@ -101,13 +99,6 @@ class MediaIngestService {
     }
 
     if (videoExtensions.contains(ext)) {
-      if (Platform.isAndroid || Platform.isIOS) {
-        throw UnsupportedError(
-          'Video file import is not supported on mobile. '
-          'Please select an audio file (.mp3, .m4a, .flac, .ogg, etc.) '
-          'or use the URL download for YouTube links.',
-        );
-      }
       onLog?.call('Extracting audio from video with ffmpeg\u2026');
       return _extractAudioWithFfmpeg(
         videoFile: src,

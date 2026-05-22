@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../services/audio_player_service.dart';
+import 'plamus_toast.dart';
 
 /// Small player control that opens the one-shot sleep timer sheet.
 class SleepTimerButton extends StatefulWidget {
@@ -140,11 +141,16 @@ class _SleepTimerSheetState extends State<_SleepTimerSheet> {
     final duration = Duration(minutes: minutes);
     final label = _formatDurationLabel(duration);
     final audio = context.read<AudioPlayerService>();
-    final messenger = ScaffoldMessenger.of(context);
+    // Capture the root navigator/overlay context BEFORE popping the sheet
+    // so the toast can attach to the underlying screen's overlay rather
+    // than the sheet's (which is about to be torn down).
+    final rootContext = Navigator.of(context, rootNavigator: true).context;
     audio.setSleepTimer(duration);
     Navigator.of(context).pop();
-    messenger.showSnackBar(
-      SnackBar(content: Text('Sleep timer set for $label')),
+    PlamusToast.show(
+      rootContext,
+      message: 'Sleep timer set for $label',
+      icon: Icons.bedtime,
     );
   }
 
@@ -159,11 +165,13 @@ class _SleepTimerSheetState extends State<_SleepTimerSheet> {
 
   void _cancelTimer() {
     final audio = context.read<AudioPlayerService>();
-    final messenger = ScaffoldMessenger.of(context);
+    final rootContext = Navigator.of(context, rootNavigator: true).context;
     audio.cancelSleepTimer();
     Navigator.of(context).pop();
-    messenger.showSnackBar(
-      const SnackBar(content: Text('Sleep timer cancelled')),
+    PlamusToast.show(
+      rootContext,
+      message: 'Sleep timer cancelled',
+      icon: Icons.bedtime_off_outlined,
     );
   }
 

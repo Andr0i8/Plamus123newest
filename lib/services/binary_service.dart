@@ -10,9 +10,9 @@ import 'plamus_paths.dart';
 /// Resolved paths to external CLI tools used by Plamus.
 ///
 /// [ytDlpPath] and [ffmpegPath] point to executables on disk after
-/// [BinaryService.ensureBinariesExtracted] runs. [errors] lists human-readable
-/// problems (e.g. missing asset, no network) without throwing from the
-/// initializer so the rest of the app still starts.
+/// [BinaryService.ensureBinariesExtracted] runs. [errors] lists
+/// human-readable problems (e.g. missing asset, no network) without
+/// throwing from the initializer so the rest of the app still starts.
 class BinaryResolution {
   /// Creates a resolution result.
   const BinaryResolution({
@@ -39,23 +39,20 @@ class BinaryResolution {
   final List<String> errors;
 }
 
-/// Resolves CLI tools (`yt-dlp`, `ffmpeg`) needed by the desktop builds.
+/// Resolves CLI tools (`yt-dlp`, `ffmpeg`) needed for desktop builds.
 ///
-/// **Windows:** extracts bundled `yt-dlp.exe` and `ffmpeg.exe` from Flutter
-/// assets into the per-user application support directory. Assets must be
-/// declared under `assets/bin/` in `pubspec.yaml`.
+/// **Windows:** extracts bundled `yt-dlp.exe` and `ffmpeg.exe` from
+/// Flutter assets into the per-user application support directory.
+/// Assets must be declared under `assets/bin/` in `pubspec.yaml`.
 ///
 /// **Linux:** downloads the latest static `yt-dlp` build from GitHub on
-/// first run into `~/.local/share/plamus/bin/` and `chmod +x`'s it. ffmpeg
-/// is resolved against the system `PATH` (`which ffmpeg`); if missing,
-/// [BinaryResolution.errors] tells the user to install it via their package
-/// manager.
+/// first run into `~/.local/share/plamus/bin/` and `chmod +x`'s it.
+/// ffmpeg is resolved against the system `PATH` (`which ffmpeg`); if
+/// missing, [BinaryResolution.errors] tells the user to install it via
+/// their package manager.
 ///
-/// **macOS:** unchanged behavior (uses asset extraction; no maintained build
-/// today, but the API is preserved).
-///
-/// If any binary is absent, the app still starts and [BinaryResolution.errors]
-/// explains what is missing.
+/// If any binary is absent, the app still starts and
+/// [BinaryResolution.errors] explains what is missing.
 class BinaryService {
   BinaryService._();
 
@@ -64,10 +61,10 @@ class BinaryService {
   static const String _assetYtDlpWin = 'assets/bin/yt-dlp.exe';
   static const String _assetFfmpegWin = 'assets/bin/ffmpeg.exe';
 
-  /// Source for the static Linux yt-dlp build.
-  ///
-  /// The `latest/download/yt-dlp` URL redirects to whichever release is
-  /// current; `Client.send` follows redirects up to [http.Request.maxRedirects].
+  /// Source for the static Linux yt-dlp build. The
+  /// `latest/download/yt-dlp` URL redirects to whichever release is
+  /// current; `Client.send` follows redirects up to
+  /// [http.Request.maxRedirects].
   static const String _ytDlpLinuxUrl =
       'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
 
@@ -76,34 +73,38 @@ class BinaryService {
 
   BinaryResolution? _cached;
 
-  /// Last successful or attempted resolution (null until [ensureBinariesExtracted]).
+  /// Last successful or attempted resolution (null until
+  /// [ensureBinariesExtracted]).
   BinaryResolution? get lastResolution => _cached;
 
   /// Resolves binaries for the current platform.
   ///
-  /// Safe to call on every launch: existing on-disk binaries are reused and
-  /// only redownloaded / rewritten when they are missing or look invalid.
-  ///
-  /// Returns an empty resolution on unsupported platforms (mobile uses
-  /// `AudioDownloadService` instead).
+  /// Safe to call on every launch: existing on-disk binaries are reused
+  /// and only redownloaded / rewritten when they are missing or look
+  /// invalid.
   Future<BinaryResolution> ensureBinariesExtracted() async {
     if (Platform.isLinux) {
       return _cached = await _resolveLinux();
     }
-    if (Platform.isWindows || Platform.isMacOS) {
+    if (Platform.isWindows) {
       return _cached = await _resolveBundledAssets();
     }
-    // Mobile / unknown: caller should not hit this path.
+    // Plamus is desktop-only (Linux + Windows). Other platforms get an
+    // empty resolution and the UI surfaces the errors via the import
+    // panel banner.
     return _cached = const BinaryResolution(
       ytDlpPath: '',
       ffmpegPath: '',
       ytDlpAvailable: false,
       ffmpegAvailable: false,
+      errors: [
+        'Plamus is built for Linux and Windows only.',
+      ],
     );
   }
 
   // ---------------------------------------------------------------------------
-  // Windows / macOS: extract bundled assets
+  // Windows: extract bundled assets
   // ---------------------------------------------------------------------------
 
   Future<BinaryResolution> _resolveBundledAssets() async {

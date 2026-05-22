@@ -6,6 +6,8 @@ import 'package:provider/provider.dart';
 import '../../models/track_model.dart';
 import '../../services/audio_player_service.dart';
 import '../../services/library_service.dart';
+import '../theme/theme_controller.dart';
+import 'track_artwork.dart';
 
 /// Library row with hover, context actions, and inline title editing.
 class TrackTile extends StatefulWidget {
@@ -144,11 +146,48 @@ class _TrackTileState extends State<TrackTile> {
     }
   }
 
+  /// Builds the row's leading widget. When artwork is disabled the layout
+  /// is identical to the pre-artwork build (heart button only); when
+  /// enabled the cover thumbnail (or its placeholder) is rendered before
+  /// the heart so the like control stays exactly where users expect it.
+  Widget _buildLeading(
+    ThemeData theme,
+    LibraryService lib,
+    bool showArtwork,
+  ) {
+    final heart = IconButton(
+      tooltip: widget.track.isLiked ? 'Unlike' : 'Like',
+      icon: Icon(
+        widget.track.isLiked ? Icons.favorite : Icons.favorite_border,
+        color: widget.track.isLiked ? theme.colorScheme.primary : null,
+        size: 22,
+      ),
+      onPressed: () async {
+        await lib.toggleLike(widget.track);
+        widget.onRenamed();
+      },
+    );
+    if (!showArtwork) return heart;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        TrackArtwork(track: widget.track, size: 48),
+        const SizedBox(width: 8),
+        heart,
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final audio = context.read<AudioPlayerService>();
     final lib = context.read<LibraryService>();
+    // Watching ThemeController here makes the leading column rebuild
+    // when the user toggles "Show track artwork" — the existing heart
+    // button stays in place and the artwork square appears/disappears
+    // alongside it without a layout pop.
+    final showArtwork = context.watch<ThemeController>().showArtwork;
 
     // Get context tracks for queue building
     final contextTracks = widget.contextTracks ?? [widget.track];
@@ -212,22 +251,7 @@ class _TrackTileState extends State<TrackTile> {
                     child: ListTile(
                       contentPadding: const EdgeInsets.symmetric(
                           horizontal: 16, vertical: 8),
-                      leading: IconButton(
-                        tooltip: widget.track.isLiked ? 'Unlike' : 'Like',
-                        icon: Icon(
-                          widget.track.isLiked
-                              ? Icons.favorite
-                              : Icons.favorite_border,
-                          color: widget.track.isLiked
-                              ? theme.colorScheme.primary
-                              : null,
-                          size: 22,
-                        ),
-                        onPressed: () async {
-                          await lib.toggleLike(widget.track);
-                          widget.onRenamed();
-                        },
-                      ),
+                      leading: _buildLeading(theme, lib, showArtwork),
                       title: Row(
                         children: [
                           Expanded(

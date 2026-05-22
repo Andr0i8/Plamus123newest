@@ -26,7 +26,12 @@ class DatabaseHelper {
   ///         the main library view (`getAllTracks` now filters on this).
   ///   * 3 — added nullable `tracks.sourceUrl` to preserve the original
   ///         YouTube URL for sharing downloaded tracks.
-  static const int _dbVersion = 3;
+  ///   * 4 — added nullable `tracks.artworkPath` so the UI can render
+  ///         locally-saved cover art (typically a YouTube thumbnail
+  ///         downloaded next to the audio file). Existing rows leave the
+  ///         column NULL and the UI keeps showing the placeholder for
+  ///         them — there's no destructive migration.
+  static const int _dbVersion = 4;
 
   Database? _db;
 
@@ -69,6 +74,12 @@ class DatabaseHelper {
       // Nullable so existing local/imported rows remain valid.
       await db.execute('ALTER TABLE tracks ADD COLUMN sourceUrl TEXT');
     }
+    if (oldVersion < 4) {
+      // v3 → v4: store the absolute path of a locally-saved cover image.
+      // Nullable: existing rows that pre-date artwork support fall back
+      // to the generic placeholder — no destructive migration.
+      await db.execute('ALTER TABLE tracks ADD COLUMN artworkPath TEXT');
+    }
   }
 
   Future<void> _createTables(Database db, int version) async {
@@ -79,6 +90,7 @@ class DatabaseHelper {
         artist TEXT NOT NULL,
         filePath TEXT NOT NULL UNIQUE,
         sourceUrl TEXT,
+        artworkPath TEXT,
         durationMs INTEGER NOT NULL DEFAULT 0,
         isLiked INTEGER NOT NULL DEFAULT 0,
         inLibrary INTEGER NOT NULL DEFAULT 1,
@@ -336,6 +348,29 @@ class DatabaseHelper {
       where: 'trackId = ?',
       whereArgs: [trackId],
     );
+  }
+
+  // --- Bulk wipe ---
+
+  /// Empties every library table in a single transaction. Powers the
+  /// "Clear all data" Settings action. Schema is preserved — only row
+  /// content is removed — so the next launch reuses the same SQLite
+  /// file without an upgrade dance. The on-disk audio / artwork files
+  /// are deleted separately by [LibraryService.clearAllData] since
+  /// they live outside the database.
+  ///
+  /// Foreign-key cascade from `playlists` would handle
+  /// `playlist_tracks` automatically, but we delete every table
+  /// explicitly to be obvious about intent and to keep this method
+  /// safe under any future schema rework.
+  Future<void> wipeAllData() async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('history');
+      await txn.delete('playlist_tracks');
+      await txn.delete('playlists');
+      await txn.delete('tracks');
+    });
   }
 
   /// Closes the DB (e.g. for tests).

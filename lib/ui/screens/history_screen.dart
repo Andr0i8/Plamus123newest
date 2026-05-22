@@ -8,6 +8,8 @@ import '../../models/history_entry.dart';
 import '../../models/track_model.dart';
 import '../../services/audio_player_service.dart';
 import '../../services/library_service.dart';
+import '../theme/theme_controller.dart';
+import '../widgets/track_artwork.dart';
 
 /// Chronological “Recently played” smart list (up to 50 DB rows).
 class HistoryScreen extends StatefulWidget {
@@ -320,6 +322,10 @@ class _HistoryTrackTileState extends State<_HistoryTrackTile> {
     final theme = Theme.of(context);
     final audio = context.watch<AudioPlayerService>();
     final lib = context.read<LibraryService>();
+    // See `track_tile.dart` — same rationale: watch ThemeController so
+    // the leading column rebuilds when the user toggles "Show track
+    // artwork" without touching every parent screen.
+    final showArtwork = context.watch<ThemeController>().showArtwork;
 
     // Check if this track is currently playing AND was started from the
     // history surface. Tracks playing from the library / liked / a
@@ -334,6 +340,29 @@ class _HistoryTrackTileState extends State<_HistoryTrackTile> {
 
     // Get context tracks for queue building
     final contextTracks = widget.contextTracks ?? [widget.track];
+
+    final heart = IconButton(
+      tooltip: widget.track.isLiked ? 'Unlike' : 'Like',
+      icon: Icon(
+        widget.track.isLiked ? Icons.favorite : Icons.favorite_border,
+        color: widget.track.isLiked ? theme.colorScheme.primary : null,
+        size: 22,
+      ),
+      onPressed: () async {
+        await lib.toggleLike(widget.track);
+        widget.onChanged();
+      },
+    );
+    final Widget leading = showArtwork
+        ? Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TrackArtwork(track: widget.track, size: 48),
+              const SizedBox(width: 8),
+              heart,
+            ],
+          )
+        : heart;
 
     return MouseRegion(
       onEnter: (_) => setState(() => _hover = true),
@@ -357,18 +386,7 @@ class _HistoryTrackTileState extends State<_HistoryTrackTile> {
           child: ListTile(
             contentPadding:
                 const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            leading: IconButton(
-              tooltip: widget.track.isLiked ? 'Unlike' : 'Like',
-              icon: Icon(
-                widget.track.isLiked ? Icons.favorite : Icons.favorite_border,
-                color: widget.track.isLiked ? theme.colorScheme.primary : null,
-                size: 22,
-              ),
-              onPressed: () async {
-                await lib.toggleLike(widget.track);
-                widget.onChanged();
-              },
-            ),
+            leading: leading,
             title: Row(
               children: [
                 Expanded(

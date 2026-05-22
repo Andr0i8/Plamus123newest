@@ -1,15 +1,14 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 
-import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart' as ja;
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../database/database_helper.dart';
 import '../models/repeat_mode.dart';
 import '../models/track_model.dart';
+import '../ui/theme/theme_controller.dart';
 
 /// Identifies the UI surface that started playback (`"library"`,
 /// `"liked"`, `"history"`, or `"playlist:{id}"`). Used by track tiles to
@@ -86,6 +85,15 @@ class AudioPlayerService extends ChangeNotifier {
   /// Wall-clock expiration for [_sleepTimer], used by the UI to show
   /// remaining time without persisting anything between app launches.
   DateTime? _sleepTimerEndsAt;
+
+  /// Cached "show track artwork" setting. Read from SharedPreferences in
+  /// [init] and refreshed at every [setQueue] / shuffle reload, plus
+  /// directly via [setShowArtwork] when the user toggles it in Settings
+  /// while a track is loaded. The desktop UI (track tiles, glass player
+  /// bar, now-playing screen) reads this through
+  /// [ThemeController.showArtwork] but we keep a copy here for parity
+  /// with previous releases.
+  bool _showArtwork = true;
 
   /// Guards async timer callbacks from notifying after service disposal.
   bool _disposed = false;
@@ -179,13 +187,16 @@ class AudioPlayerService extends ChangeNotifier {
         state == ja.ProcessingState.loading;
   }
 
-  /// Configures session category and wires player streams.
+  /// Configures the player and wires its streams.
   Future<void> init() async {
     isLoading = true;
     notifyListeners();
 
-    final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration.music());
+    // Pick up the persisted "show track artwork" preference up front so
+    // any UI that reads `showArtwork` synchronously during the first
+    // frame sees the user's saved choice rather than the default.
+    await _refreshShowArtworkFromPrefs();
+
     await _player.setVolume(volume);
     await _player.setLoopMode(ja.LoopMode.off);
 
@@ -292,6 +303,12 @@ class AudioPlayerService extends ChangeNotifier {
       return;
     }
 
+    // Re-read the persisted "show artwork" preference at every queue
+    // change so a user who flipped the toggle while music was playing
+    // still gets the right artUri on the next playback session even if
+    // the settings screen forgot to call setShowArtwork directly.
+    await _refreshShowArtworkFromPrefs();
+
     _queue = List<TrackModel>.from(tracks);
     _playbackContextId = contextId;
     // A fresh queue invalidates any previous shuffle session bookkeeping:
@@ -337,30 +354,41 @@ class AudioPlayerService extends ChangeNotifier {
 
   /// Builds a [ja.ConcatenatingAudioSource] from [tracks]. Extracted so
   /// shuffle toggles can rebuild the engine source from the same code
-  /// path that [setQueue] uses, keeping the mobile-vs-desktop tag
-  /// behavior in one place.
+  /// path that [setQueue] uses.
   ja.ConcatenatingAudioSource _buildAudioSource(List<TrackModel> tracks) {
     return ja.ConcatenatingAudioSource(
-      children: tracks.map((t) {
-        // Create MediaItem for mobile platforms (powers media-session
-        // notifications via just_audio_background).
-        final mediaItem = MediaItem(
-          id: t.id?.toString() ?? t.filePath,
-          album: 'Library',
-          title: t.title,
-          artist: t.artist,
-          duration:
-              t.durationMs > 0 ? Duration(milliseconds: t.durationMs) : null,
-        );
-
-        // CRITICAL: Only attach the tag on mobile to avoid sequence
-        // validation errors in just_audio's desktop (media_kit) path.
-        return Platform.isAndroid || Platform.isIOS
-            ? ja.AudioSource.file(t.filePath, tag: mediaItem)
-            : ja.AudioSource.file(t.filePath);
-      }).toList(),
+      children: tracks
+          .map((t) => ja.AudioSource.file(t.filePath))
+          .toList(),
     );
   }
+
+  /// Reads the persisted "Show track artwork" preference and updates the
+  /// cached value. Failures default to `true` (artwork on) so a missing
+  /// SharedPreferences install doesn't silently strip the cover image.
+  Future<void> _refreshShowArtworkFromPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _showArtwork =
+          prefs.getBool(ThemeController.showArtworkPrefKey) ?? true;
+    } catch (e) {
+      debugPrint('AudioPlayerService: showArtwork pref read failed: $e');
+      _showArtwork = true;
+    }
+  }
+
+  /// Updates the cached "Show track artwork" preference. Called by the
+  /// settings UI after toggling so the next track switch (or queue
+  /// rebuild) picks up the new value without a SharedPreferences
+  /// roundtrip. The persistent storage is owned by [ThemeController].
+  void setShowArtwork(bool value) {
+    _showArtwork = value;
+  }
+
+  /// Whether the cached "Show track artwork" preference is currently on.
+  /// Used internally and by tests; the UI watches [ThemeController]
+  /// directly because that's what owns the persisted source of truth.
+  bool get showArtwork => _showArtwork;
 
   /// Plays a single track from a list context.
   ///

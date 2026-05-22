@@ -1,12 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:provider/provider.dart';
 
+import '../../services/audio_player_service.dart';
+import '../../services/library_service.dart';
 import '../theme/theme_controller.dart';
 
-/// Settings screen with accent color and text color customization.
+/// Settings screen with appearance + library customization plus the
+/// "Clear all data" reset action.
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
+
+  /// GitHub repository URL surfaced as a small footer link. Tapping it
+  /// copies the URL to the clipboard so users on offline / sandboxed
+  /// machines can still grab the address without needing
+  /// `url_launcher` (an extra plugin we don't otherwise need).
+  static const String _githubUrl = 'https://github.com/Andr0i8/Plamus';
 
   @override
   Widget build(BuildContext context) {
@@ -111,7 +121,8 @@ class SettingsScreen extends StatelessWidget {
                     title: const Text('Text color'),
                     subtitle: Text(
                       themeCtrl.hasCustomTextColor
-                          ? 'Custom color applied across the app'
+                          ? 'Custom color applied to '
+                              '${themeCtrl.isDark ? 'dark' : 'light'} theme'
                           : 'Follows theme (white on dark, black on light)',
                     ),
                     trailing: Container(
@@ -146,6 +157,90 @@ class SettingsScreen extends StatelessWidget {
                       label: const Text('Default'),
                     ),
                   ),
+                  const SizedBox(height: 24),
+                  Text(
+                    'Library',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  // "Show track artwork" toggle. When OFF the UI behaves
+                  // exactly like the pre-artwork build: track tiles use
+                  // the like-icon leading and the player surfaces fall
+                  // back to the placeholder. When ON, every track that
+                  // has a sibling thumbnail JPG (downloaded alongside
+                  // the audio) renders it; tracks without artwork keep
+                  // showing the placeholder.
+                  ListTile(
+                    leading: Icon(
+                      themeCtrl.showArtwork
+                          ? Icons.photo_library
+                          : Icons.photo_library_outlined,
+                      color: themeCtrl.accentColor,
+                    ),
+                    title: const Text('Show track artwork'),
+                    subtitle: Text(
+                      themeCtrl.showArtwork
+                          ? 'YouTube thumbnails appear in tiles and the player bar'
+                          : 'Tracks render with a placeholder icon — no images',
+                    ),
+                    trailing: Switch(
+                      value: themeCtrl.showArtwork,
+                      onChanged: (v) {
+                        themeCtrl.setShowArtwork(v);
+                        // Mirror the value into the audio service so
+                        // the cached preference stays in sync without
+                        // waiting for a SharedPreferences round-trip.
+                        context.read<AudioPlayerService>().setShowArtwork(v);
+                      },
+                    ),
+                    onTap: () {
+                      final next = !themeCtrl.showArtwork;
+                      themeCtrl.setShowArtwork(next);
+                      context
+                          .read<AudioPlayerService>()
+                          .setShowArtwork(next);
+                    },
+                  ),
+                  const SizedBox(height: 32),
+                  // "Danger zone" — a single destructive action that
+                  // resets the app to a freshly-installed state.
+                  // Visually tinted with the theme's error color so
+                  // users understand the row is different from the
+                  // ones above.
+                  Text(
+                    'Data',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  ListTile(
+                    leading: Icon(
+                      Icons.delete_forever_outlined,
+                      color: theme.colorScheme.error,
+                    ),
+                    title: Text(
+                      'Clear all data',
+                      style: TextStyle(color: theme.colorScheme.error),
+                    ),
+                    subtitle: const Text(
+                      'Delete every track, playlist, history entry and '
+                      'audio/artwork file on disk',
+                    ),
+                    onTap: () => _confirmClearAllData(context),
+                  ),
+                  const SizedBox(height: 24),
+                  // Subtle GitHub link — small text aligned right, no
+                  // button styling, taps copy the URL to clipboard +
+                  // show a toast confirmation. Kept unobtrusive per
+                  // the spec.
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: _GithubFooterLink(url: _githubUrl),
+                  ),
+                  const SizedBox(height: 24),
                 ],
               ),
             ),
@@ -153,6 +248,72 @@ class SettingsScreen extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  /// Two-step confirmation flow for the "Clear all data" action.
+  ///
+  /// 1. Tap → AlertDialog explaining what will be deleted.
+  /// 2. Confirm → audio playback is stopped (so Windows releases the
+  ///    file lock on the currently-playing track) and the library
+  ///    service wipes both the database and the on-disk audio /
+  ///    artwork files.
+  ///
+  /// After the wipe, every Provider listener repaints with the empty
+  /// state and the user sees the app as if freshly installed (modulo
+  /// theme / accent preferences, which are not user content and stay
+  /// per standard "Clear data" UX).
+  Future<void> _confirmClearAllData(BuildContext context) async {
+    // Capture handles BEFORE the dialog opens so we don't pass a stale
+    // BuildContext across async gaps.
+    final audio = context.read<AudioPlayerService>();
+    final lib = context.read<LibraryService>();
+    final messenger = ScaffoldMessenger.of(context);
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        final dialogTheme = Theme.of(ctx);
+        return AlertDialog(
+          title: const Text('Clear all data?'),
+          content: const Text(
+            'This permanently deletes every track, playlist, and history '
+            'entry from the database, and removes every audio + artwork '
+            'file from your library folder.\n\nThis cannot be undone.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: dialogTheme.colorScheme.error,
+                foregroundColor: dialogTheme.colorScheme.onError,
+              ),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Delete everything'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      // Stop playback first — Windows holds an exclusive lock on the
+      // currently-playing file via media_kit, and the per-file delete
+      // inside [LibraryService.clearAllData] would silently skip it.
+      await audio.stop();
+      await lib.clearAllData();
+      messenger.showSnackBar(
+        const SnackBar(content: Text('All library data cleared.')),
+      );
+    } catch (e) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Could not clear data: $e')),
+      );
+    }
   }
 
   /// Full-RGB color picker for the accent color.
@@ -244,6 +405,63 @@ class SettingsScreen extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+/// Subtle footer link to the Plamus GitHub repository. Renders as
+/// small dimmed text aligned to the trailing edge of the settings
+/// column; tapping it copies the URL to the clipboard and surfaces a
+/// brief confirmation SnackBar.
+///
+/// We deliberately don't launch a browser (avoids adding a
+/// `url_launcher` dependency just for this footer) — copying the URL
+/// works on every platform Plamus targets and matches "small,
+/// unobtrusive" from the spec.
+class _GithubFooterLink extends StatelessWidget {
+  const _GithubFooterLink({required this.url});
+
+  final String url;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dimmedColor =
+        theme.textTheme.bodySmall?.color?.withValues(alpha: 0.55) ??
+            theme.colorScheme.onSurface.withValues(alpha: 0.55);
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: () async {
+        final messenger = ScaffoldMessenger.of(context);
+        await Clipboard.setData(ClipboardData(text: url));
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('GitHub link copied to clipboard'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.code,
+              size: 14,
+              color: dimmedColor,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              url,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: dimmedColor,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

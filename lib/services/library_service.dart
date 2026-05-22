@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import '../database/database_helper.dart';
 import '../models/playlist_model.dart';
 import '../models/track_model.dart';
+import 'plamus_paths.dart';
 import 'shell_service.dart';
 
 /// Coordinates SQLite and filesystem operations for the music library UI.
@@ -38,6 +39,13 @@ class LibraryService extends ChangeNotifier {
   /// [sourceUrl] stores the original YouTube URL for later sharing. Leave it
   /// null for local files and non-YouTube direct audio links.
   ///
+  /// [artworkPath] points at a locally-saved cover image (typically a
+  /// YouTube thumbnail) downloaded next to the audio file. Pass `null`
+  /// when no artwork is available — the UI falls back to the placeholder.
+  /// When the file is already indexed and no artwork was previously
+  /// stored, the existing row is updated with [artworkPath] so re-imports
+  /// can backfill missing covers.
+  ///
   /// [inLibrary] controls whether the new row is visible in the main
   /// library list. Pass `false` when importing directly into a playlist so
   /// the track only appears in that playlist (BUG 6). When the file is
@@ -48,6 +56,7 @@ class LibraryService extends ChangeNotifier {
     String? artist,
     String? title,
     String? sourceUrl,
+    String? artworkPath,
     bool inLibrary = true,
   }) async {
     final f = File(filePath);
@@ -56,9 +65,10 @@ class LibraryService extends ChangeNotifier {
     }
     final sqlite = await _db.database;
     final normalizedSourceUrl = _normalizeOptionalUrl(sourceUrl);
+    final normalizedArtwork = _normalizeOptionalPath(artworkPath);
     final existing = await sqlite.query(
       'tracks',
-      columns: ['id', 'sourceUrl'],
+      columns: ['id', 'sourceUrl', 'artworkPath'],
       where: 'filePath = ?',
       whereArgs: [filePath],
       limit: 1,
@@ -68,10 +78,23 @@ class LibraryService extends ChangeNotifier {
       final existingSource = _normalizeOptionalUrl(
         existing.first['sourceUrl'] as String?,
       );
+      final existingArtwork = _normalizeOptionalPath(
+        existing.first['artworkPath'] as String?,
+      );
+      final updates = <String, Object?>{};
       if (normalizedSourceUrl != null && existingSource == null) {
+        updates['sourceUrl'] = normalizedSourceUrl;
+      }
+      // Backfill artwork for tracks that were imported before artwork
+      // support landed (or where the previous fetch failed and the user
+      // re-imported the same file).
+      if (normalizedArtwork != null && existingArtwork == null) {
+        updates['artworkPath'] = normalizedArtwork;
+      }
+      if (updates.isNotEmpty) {
         await sqlite.update(
           'tracks',
-          {'sourceUrl': normalizedSourceUrl},
+          updates,
           where: 'id = ?',
           whereArgs: [id],
         );
@@ -90,6 +113,7 @@ class LibraryService extends ChangeNotifier {
       artist: resolvedArtist,
       filePath: filePath,
       sourceUrl: normalizedSourceUrl,
+      artworkPath: normalizedArtwork,
       durationMs: 0,
       inLibrary: inLibrary,
       dateAdded: DateTime.now().toUtc().toIso8601String(),
@@ -175,6 +199,12 @@ class LibraryService extends ChangeNotifier {
   /// Updates title and renames the underlying file to match (Windows-safe).
   ///
   /// Throws [FileSystemException] if the rename fails (e.g. file in use).
+  ///
+  /// When the track has a sibling artwork file (`<basename>.jpg`) it is
+  /// renamed alongside the audio so the cover image stays paired with
+  /// the track row. Artwork rename failures are non-fatal — the audio
+  /// file is the source of truth and we'd rather show the placeholder
+  /// than fail the title edit because of a stale JPG.
   Future<void> renameTrackTitle(TrackModel track, String newTitle) async {
     if (track.id == null) {
       throw StateError('Cannot rename a track without id');
@@ -199,9 +229,41 @@ class LibraryService extends ChangeNotifier {
       await oldFile.rename(targetPath);
     }
 
-    await _db.updateTrack(
-      track.copyWith(title: trimmed, filePath: targetPath),
-    );
+    String? newArtworkPath = track.artworkPath;
+    final oldArtworkPath = track.artworkPath;
+    if (oldArtworkPath != null && oldArtworkPath.isNotEmpty) {
+      try {
+        final oldArtwork = File(oldArtworkPath);
+        if (await oldArtwork.exists()) {
+          final artworkExt = p.extension(oldArtworkPath);
+          final desired = p.join(
+            p.dirname(targetPath),
+            '${p.basenameWithoutExtension(targetPath)}$artworkExt',
+          );
+          // Only move when source != destination to avoid a
+          // self-overwrite.
+          if (desired != oldArtworkPath) {
+            final unique = await _ensureUniquePath(desired, oldArtworkPath);
+            await oldArtwork.rename(unique);
+            newArtworkPath = unique;
+          }
+        } else {
+          // Artwork file is gone; clear the column so the UI falls back
+          // to the placeholder instead of trying to render a missing file.
+          newArtworkPath = null;
+        }
+      } catch (e) {
+        // Non-fatal — fall back to clearing the artwork reference rather
+        // than blocking the rename.
+        newArtworkPath = null;
+      }
+    }
+
+    final updated = track.copyWith(title: trimmed, filePath: targetPath);
+    final finalTrack = newArtworkPath == null
+        ? updated.copyWith(clearArtwork: true)
+        : updated.copyWith(artworkPath: newArtworkPath);
+    await _db.updateTrack(finalTrack);
     await refreshTracks();
   }
 
@@ -234,6 +296,12 @@ class LibraryService extends ChangeNotifier {
   }
 
   /// Removes DB row and optionally deletes the file from the library folder.
+  ///
+  /// When [deleteFile] is true the sibling artwork file (if any) is also
+  /// removed so the library directory doesn't accumulate orphaned cover
+  /// images. Artwork deletion failures are silently ignored — the audio
+  /// is the source of truth and we don't want a stale JPG to block the
+  /// remove action.
   Future<void> deleteTrack(TrackModel track, {bool deleteFile = true}) async {
     if (track.id == null) return;
     if (deleteFile) {
@@ -241,12 +309,78 @@ class LibraryService extends ChangeNotifier {
       if (await f.exists()) {
         await f.delete();
       }
+      final artworkPath = track.artworkPath;
+      if (artworkPath != null && artworkPath.isNotEmpty) {
+        try {
+          final artFile = File(artworkPath);
+          if (await artFile.exists()) {
+            await artFile.delete();
+          }
+        } catch (_) {
+          // Leave behind a stray JPG rather than fail the delete.
+        }
+      }
     }
     await _db.deleteTrack(track.id!);
     await refreshTracks();
   }
 
+  /// Wipes every row from the library tables AND deletes every file
+  /// inside the on-disk music library directory. Used by the "Clear
+  /// all data" Settings action.
+  ///
+  /// Order matters:
+  ///   1. Empty the database first so the rest of the app sees the
+  ///      now-orphaned files as gone even if a per-file delete fails.
+  ///   2. Walk the library directory and remove every entry. Per-file
+  ///      failures (locked file, permissions, etc.) are swallowed so
+  ///      one stubborn file can't strand the rest — the user gets a
+  ///      clean DB regardless of filesystem state.
+  ///   3. Refresh the in-memory caches so every widget watching
+  ///      [LibraryService] repaints with the empty state.
+  ///
+  /// The caller is responsible for stopping audio playback BEFORE
+  /// calling this — on Windows, the file currently playing is locked
+  /// by the audio engine and can't be removed until [AudioPlayerService.stop]
+  /// has released the handle.
+  Future<void> clearAllData() async {
+    await _db.wipeAllData();
+
+    try {
+      final libPath = await PlamusPaths.musicLibraryDirectory();
+      final libDir = Directory(libPath);
+      if (await libDir.exists()) {
+        await for (final entry in libDir.list(followLinks: false)) {
+          try {
+            if (entry is File) {
+              await entry.delete();
+            } else if (entry is Directory) {
+              await entry.delete(recursive: true);
+            }
+          } catch (e) {
+            // Best-effort: ignore per-file failures so the rest still
+            // gets cleaned up. The DB rows are gone regardless.
+            debugPrint(
+              'LibraryService.clearAllData: could not delete ${entry.path}: $e',
+            );
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint(
+        'LibraryService.clearAllData: could not enumerate library dir: $e',
+      );
+    }
+
+    await refreshAll();
+  }
+
   static String? _normalizeOptionalUrl(String? raw) {
+    final value = raw?.trim();
+    return value == null || value.isEmpty ? null : value;
+  }
+
+  static String? _normalizeOptionalPath(String? raw) {
     final value = raw?.trim();
     return value == null || value.isEmpty ? null : value;
   }

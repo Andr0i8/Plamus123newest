@@ -10,6 +10,7 @@ class TrackModel {
     required this.artist,
     required this.filePath,
     this.sourceUrl,
+    this.artworkPath,
     required this.durationMs,
     this.isLiked = false,
     this.inLibrary = true,
@@ -50,6 +51,12 @@ class TrackModel {
     return value;
   }
 
+  /// Absolute path to a locally-saved cover image (typically a YouTube
+  /// thumbnail downloaded next to the audio file). `null` for tracks that
+  /// were imported as local files or downloaded before artwork support
+  /// landed — the UI falls back to the generic placeholder for those.
+  final String? artworkPath;
+
   /// Duration in milliseconds (0 if unknown).
   final int durationMs;
 
@@ -72,6 +79,7 @@ class TrackModel {
       artist: map['artist'] as String? ?? 'Unknown',
       filePath: map['filePath'] as String? ?? '',
       sourceUrl: map['sourceUrl'] as String?,
+      artworkPath: map['artworkPath'] as String?,
       durationMs: (map['durationMs'] as int?) ?? 0,
       isLiked: ((map['isLiked'] as int?) ?? 0) == 1,
       // Default to true so older rows inserted before the v2 migration
@@ -90,6 +98,7 @@ class TrackModel {
       'artist': artist,
       'filePath': filePath,
       'sourceUrl': sourceUrl,
+      'artworkPath': artworkPath,
       'durationMs': durationMs,
       'isLiked': isLiked ? 1 : 0,
       'inLibrary': inLibrary ? 1 : 0,
@@ -98,12 +107,22 @@ class TrackModel {
   }
 
   /// Returns a copy with selective overrides.
+  ///
+  /// To explicitly clear [artworkPath] (e.g. after the file was deleted on
+  /// disk), pass [clearArtwork] = true. [artworkPath] alone cannot
+  /// represent "set to null" because Dart treats unspecified named
+  /// parameters as null too — the boolean disambiguates "leave as-is" vs.
+  /// "clear it". Same convention follows for [sourceUrl] / [clearSourceUrl]
+  /// for symmetry.
   TrackModel copyWith({
     int? id,
     String? title,
     String? artist,
     String? filePath,
     String? sourceUrl,
+    bool clearSourceUrl = false,
+    String? artworkPath,
+    bool clearArtwork = false,
     int? durationMs,
     bool? isLiked,
     bool? inLibrary,
@@ -114,7 +133,8 @@ class TrackModel {
       title: title ?? this.title,
       artist: artist ?? this.artist,
       filePath: filePath ?? this.filePath,
-      sourceUrl: sourceUrl ?? this.sourceUrl,
+      sourceUrl: clearSourceUrl ? null : (sourceUrl ?? this.sourceUrl),
+      artworkPath: clearArtwork ? null : (artworkPath ?? this.artworkPath),
       durationMs: durationMs ?? this.durationMs,
       isLiked: isLiked ?? this.isLiked,
       inLibrary: inLibrary ?? this.inLibrary,

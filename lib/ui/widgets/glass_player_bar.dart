@@ -7,7 +7,9 @@ import 'package:provider/provider.dart';
 import '../../models/repeat_mode.dart';
 import '../../models/track_model.dart';
 import '../../services/audio_player_service.dart';
+import '../theme/theme_controller.dart';
 import 'sleep_timer_button.dart';
+import 'track_artwork.dart';
 
 /// Professional bottom glass-style transport bar with SUBTLE polish.
 /// Hover: 1.05x scale, 150ms duration, NO glow effects.
@@ -174,6 +176,24 @@ class _GlassPlayerBarState extends State<GlassPlayerBar> {
                       // Main control row
                       Row(
                         children: [
+                          // Cover artwork — only rendered when the user
+                          // has the "Show track artwork" preference on
+                          // and a track is loaded. Hidden when artwork
+                          // is disabled so the player bar collapses
+                          // back to its pre-artwork layout, matching
+                          // the request: "When off, everything looks
+                          // exactly like before".
+                          if (track != null &&
+                              context.watch<ThemeController>().showArtwork) ...[
+                            TrackArtwork(
+                              track: track,
+                              size: 44,
+                              borderRadius: BorderRadius.circular(8),
+                              placeholderIconSize: 22,
+                              elevation: 4,
+                            ),
+                            const SizedBox(width: 12),
+                          ],
                           // Track info
                           Expanded(
                             flex: 3,

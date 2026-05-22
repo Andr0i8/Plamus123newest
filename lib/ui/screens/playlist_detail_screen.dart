@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -10,16 +8,15 @@ import '../../services/audio_player_service.dart';
 import '../../services/library_service.dart';
 import '../widgets/glass_player_bar.dart';
 import '../widgets/import_panel.dart';
-import '../widgets/mobile_mini_player.dart';
+import '../widgets/library_search_field.dart';
+import '../widgets/track_artwork.dart';
 import '../widgets/track_tile.dart';
 
 /// Single user playlist: lists ordered tracks and can play the whole queue.
 ///
-/// Hosts its own mobile mini-player at the bottom (BUG 7) because the
-/// mobile shell's bottom bar is hidden while this route is on top of the
-/// `Navigator` stack. Also exposes a back arrow + "+" action in its
-/// AppBar (BUG 6) so users can get out of the screen and add tracks
-/// without going back to the library.
+/// Renders its own back arrow + "+" action in the AppBar so users can
+/// get out of the screen and add tracks without going back to the
+/// library. The shell's persistent `GlassPlayerBar` is shown below.
 class PlaylistDetailScreen extends StatefulWidget {
   /// Creates a playlist screen for the given [playlistId].
   const PlaylistDetailScreen({super.key, required this.playlistId});
@@ -38,15 +35,42 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
   /// highlight to this specific playlist (BUG 8). Stable per route.
   late final String _contextId = 'playlist:${widget.playlistId}';
 
+  /// Drives the in-playlist search field. Owned by the state so its
+  /// content survives `_reload()` after track additions / removals.
+  final TextEditingController _searchCtrl = TextEditingController();
+
+  /// Lowercased + trimmed copy of [_searchCtrl.text] used by the
+  /// case-insensitive title / artist filter. Cached so we don't
+  /// lowercase the query for every track on every keystroke.
+  String _searchQuery = '';
+
   @override
   void initState() {
     super.initState();
     _reload();
   }
 
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
   void _reload() {
     _meta = DatabaseHelper.instance.getPlaylistById(widget.playlistId);
     _tracks = DatabaseHelper.instance.getTracksForPlaylist(widget.playlistId);
+  }
+
+  /// Filters [tracks] by the current search query (title + artist,
+  /// case-insensitive substring match). Returns the original list when
+  /// the search box is empty.
+  List<TrackModel> _filteredTracks(List<TrackModel> tracks) {
+    if (_searchQuery.isEmpty) return tracks;
+    return tracks.where((t) {
+      final title = t.title.toLowerCase();
+      final artist = t.displayArtistLabel.toLowerCase();
+      return title.contains(_searchQuery) || artist.contains(_searchQuery);
+    }).toList(growable: false);
   }
 
   /// Opens the "+" action sheet: pick between adding from the existing
@@ -154,7 +178,13 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
                     itemBuilder: (_, i) {
                       final t = candidates[i];
                       return ListTile(
-                        leading: const Icon(Icons.music_note),
+                        // [TrackArtwork] reads the same "Show track
+                        // artwork" preference used elsewhere, so this
+                        // picker stays consistent with the rest of the
+                        // library and falls back to the music-note
+                        // placeholder when artwork is disabled or
+                        // missing.
+                        leading: TrackArtwork(track: t, size: 44),
                         title: Text(
                           t.title,
                           maxLines: 1,
@@ -251,18 +281,11 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
   Widget build(BuildContext context) {
     final lib = context.read<LibraryService>();
     final audio = context.read<AudioPlayerService>();
-    final isMobile = Platform.isAndroid || Platform.isIOS;
-    // On desktop the shell uses state-based navigation (no Navigator.push),
-    // so there's nothing to pop and we omit the back arrow. On mobile the
-    // playlist screen is pushed as a route and the user needs the arrow
-    // to get back to the library list (BUG 6).
+    // The shell uses state-based navigation, so there's nothing to pop
+    // when embedded inside it (omit the back arrow). When pushed as a
+    // route, render our own back arrow plus a defensive
+    // [GlassPlayerBar] so the bottom player never disappears.
     final canPop = Navigator.of(context).canPop();
-    // Defensive: if a desktop caller ever pushes this screen as a new
-    // route (canPop == true) instead of routing through the shell's
-    // state, the shell's persistent GlassPlayerBar gets covered. Render
-    // our own copy in that case so the bottom player is NEVER missing,
-    // regardless of how the user got here.
-    final showDesktopPlayerBar = !isMobile && canPop;
 
     return FutureBuilder<PlaylistModel?>(
       future: _meta,
@@ -281,26 +304,19 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
               ),
             ],
           ),
-          // Bottom player wiring per platform / navigation source:
-          //   • Mobile: always render MobileMiniPlayer because the outer
-          //     shell's bottom nav is covered by this pushed route
-          //     (BUG 7).
-          //   • Desktop, embedded in shell (canPop == false): null — the
-          //     shell renders its own GlassPlayerBar below the body.
-          //   • Desktop, pushed as a route (canPop == true): render
-          //     GlassPlayerBar here as a defensive fallback so the
-          //     player bar never disappears even if a future call site
-          //     uses Navigator.push instead of the shell callback.
-          bottomNavigationBar: isMobile
-              ? const MobileMiniPlayer()
-              : (showDesktopPlayerBar ? const GlassPlayerBar() : null),
+          // Embedded in shell (canPop == false) → null: the shell
+          // renders its own [GlassPlayerBar] below the body. Pushed as
+          // a route → render one here so the player stays visible.
+          bottomNavigationBar:
+              canPop ? const GlassPlayerBar() : null,
           body: FutureBuilder<List<TrackModel>>(
             future: _tracks,
             builder: (context, trackSnap) {
               if (!trackSnap.hasData) {
                 return const Center(child: CircularProgressIndicator());
               }
-              final tracks = trackSnap.data!;
+              final allTracks = trackSnap.data!;
+              final filteredTracks = _filteredTracks(allTracks);
 
               return CustomScrollView(
                 physics: const BouncingScrollPhysics(),
@@ -308,40 +324,71 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
                   SliverToBoxAdapter(
                     child: Padding(
                       padding: const EdgeInsets.fromLTRB(32, 24, 32, 16),
-                      child: Row(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Expanded(
-                            child: Text(
-                              name,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .headlineMedium
-                                  ?.copyWith(fontWeight: FontWeight.w700),
-                            ),
-                          ),
-                          if (tracks.isNotEmpty)
-                            FilledButton(
-                              onPressed: () async {
-                                await audio.setQueue(
-                                  tracks,
-                                  playImmediately: true,
-                                  contextId: _contextId,
-                                );
-                              },
-                              style: FilledButton.styleFrom(
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(30),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  name,
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .headlineMedium
+                                      ?.copyWith(fontWeight: FontWeight.w700),
                                 ),
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 24, vertical: 16),
                               ),
-                              child: const Text('Play all'),
+                              if (allTracks.isNotEmpty)
+                                FilledButton(
+                                  // Play whatever the user currently
+                                  // sees: when the search filter is
+                                  // active, "Play all" plays the
+                                  // visible subset rather than the
+                                  // whole playlist, so the queue
+                                  // matches what's on screen.
+                                  onPressed: filteredTracks.isEmpty
+                                      ? null
+                                      : () async {
+                                          await audio.setQueue(
+                                            filteredTracks,
+                                            playImmediately: true,
+                                            contextId: _contextId,
+                                          );
+                                        },
+                                  style: FilledButton.styleFrom(
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(30),
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 24, vertical: 16),
+                                  ),
+                                  child: const Text('Play all'),
+                                ),
+                            ],
+                          ),
+                          // Live search field — only rendered when the
+                          // playlist actually has tracks to filter, so
+                          // a freshly-created empty playlist keeps the
+                          // big "Add a track" call-to-action front and
+                          // centre.
+                          if (allTracks.isNotEmpty) ...[
+                            const SizedBox(height: 16),
+                            LibrarySearchField(
+                              controller: _searchCtrl,
+                              onChanged: (value) {
+                                final normalized =
+                                    value.trim().toLowerCase();
+                                if (normalized == _searchQuery) return;
+                                setState(() => _searchQuery = normalized);
+                              },
+                              hintText: 'Search tracks in this playlist',
                             ),
+                          ],
                         ],
                       ),
                     ),
                   ),
-                  if (tracks.isEmpty)
+                  if (allTracks.isEmpty)
                     SliverFillRemaining(
                       hasScrollBody: false,
                       child: Center(
@@ -362,21 +409,50 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
                         ),
                       ),
                     )
+                  else if (filteredTracks.isEmpty)
+                    // Playlist has tracks but none match the active
+                    // search filter. Keep the search field interactive
+                    // (no SliverFillRemaining take-over) so the user
+                    // can keep typing or clear the query.
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(32, 48, 32, 48),
+                        child: Center(
+                          child: Text(
+                            'No tracks match "${_searchCtrl.text}".',
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.copyWith(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurface
+                                      .withValues(alpha: 0.7),
+                                ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      ),
+                    )
                   else
                     SliverList(
                       delegate: SliverChildBuilderDelegate(
                         (context, i) => TrackTile(
-                          track: tracks[i],
-                          contextTracks: tracks,
+                          track: filteredTracks[i],
+                          // Play context follows what's visible —
+                          // skipping next/previous walks the filtered
+                          // subset, matching the "Play all" behaviour
+                          // above.
+                          contextTracks: filteredTracks,
                           contextId: _contextId,
                           onRenamed: () {
                             lib.refreshAll();
                             setState(_reload);
                           },
                           onRemoveFromPlaylist: () =>
-                              _removeFromPlaylist(tracks[i]),
+                              _removeFromPlaylist(filteredTracks[i]),
                         ),
-                        childCount: tracks.length,
+                        childCount: filteredTracks.length,
                       ),
                     ),
                 ],

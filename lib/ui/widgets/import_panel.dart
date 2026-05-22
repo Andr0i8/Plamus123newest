@@ -1,12 +1,10 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../../services/audio_download_service.dart';
 import '../../services/binary_service.dart';
 import '../../services/download_service.dart';
 import '../../services/library_service.dart';
@@ -33,8 +31,8 @@ enum _ImportMode { search, link }
 ///
 /// The search tab is available on every platform (Windows, Linux, macOS,
 /// Android, iOS). The download path still differs per-platform:
-/// desktop uses the bundled `yt-dlp` binary; mobile routes via the Railway
-/// `/download` endpoint (see `YoutubeDownloadService`).
+/// desktop uses the bundled `yt-dlp` binary; mobile routes via the
+/// self-hosted yt-dlp Flask server (see `YoutubeDownloadService`).
 ///
 /// Validation behavior (BUG 4 / BUG 5):
 ///   * Empty / non-http(s) URLs are rejected inline with a red field error
@@ -149,23 +147,29 @@ class _ImportPanelState extends State<ImportPanel> {
     });
   }
 
-  /// Validates [url] for the active platform and returns an inline error
-  /// message, or `null` when the URL passes all checks.
-  String? _validateUrlForCurrentPlatform(String url) {
+  /// Validates [url] and returns an inline error message, or `null`
+  /// when the URL passes all checks. yt-dlp can pull audio from the
+  /// vast majority of media hosts (YouTube, SoundCloud, Bandcamp, …)
+  /// so we only enforce a basic shape check.
+  String? _validateUrl(String url) {
     if (url.isEmpty) {
       return 'Please paste a link first.';
     }
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       return 'Please add https:// at the start of the URL';
     }
-    final isMobile = Platform.isAndroid || Platform.isIOS;
-    if (isMobile && !AudioDownloadService.isYouTubeUrl(url)) {
-      // The mobile extractor server only handles YouTube; anything else
-      // either gets a broken HTML body back (VK, SoundCloud pages) or is
-      // outside the scope of what we ship today. Fail fast (BUG 5).
-      return 'Only YouTube links are supported';
-    }
     return null;
+  }
+
+  /// Whether [url] looks like a YouTube video URL or bare 11-char id.
+  /// Used purely to decide whether to persist the URL as the track's
+  /// `sourceUrl` (only YouTube links are interesting to share).
+  static bool _isYouTubeUrl(String url) {
+    final lower = url.toLowerCase();
+    return lower.contains('youtube.com') ||
+        lower.contains('youtu.be') ||
+        lower.contains('youtube-nocookie.com') ||
+        RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(url.trim());
   }
 
   /// Imports a local path (file picker or drop).
@@ -194,22 +198,18 @@ class _ImportPanelState extends State<ImportPanel> {
 
   /// Downloads a remote URL.
   ///
-  /// When [overrideUrl] is null the URL is read from [_urlCtrl] (link tab);
-  /// search-result taps pass the result URL directly so they can reuse this
-  /// pipeline without round-tripping through the text field.
+  /// When [overrideUrl] is null the URL is read from [_urlCtrl] (link
+  /// tab); search-result taps pass the result URL directly so they can
+  /// reuse this pipeline without round-tripping through the text field.
   ///
-  /// Mobile (Android/iOS): unified [AudioDownloadService]. YouTube URLs are
-  /// forwarded to a remote extraction server (see `YoutubeDownloadService`);
-  /// the server may include `X-Track-Title` / `X-Track-Artist` headers
-  /// which we propagate to [LibraryService.registerTrackFile] so the row
-  /// is created with the real channel name (BUG 2).
-  ///
-  /// Desktop (Windows/Linux/macOS): yt-dlp binary via [DownloadService] for
-  /// broad site support and proper MP3 transcoding.
+  /// Plamus is desktop-only, so this always runs the bundled / first-run
+  /// `yt-dlp` binary locally via [DownloadService]. Artwork is
+  /// best-effort: only YouTube URLs surface a JPG; other hosts leave
+  /// `artworkPath` null and the UI falls back to the placeholder.
   Future<void> _downloadUrl({String? overrideUrl}) async {
     final url = (overrideUrl ?? _urlCtrl.text).trim();
 
-    final validationError = _validateUrlForCurrentPlatform(url);
+    final validationError = _validateUrl(url);
     if (validationError != null) {
       await _setBusy(false, error: validationError);
       return;
@@ -219,74 +219,41 @@ class _ImportPanelState extends State<ImportPanel> {
     await _setBusy(true, p: 0, msg: 'Starting download\u2026', error: null);
 
     try {
-      final root = await PlamusPaths.musicLibraryDirectory();
-      String outputPath;
-      String? remoteTitle;
-      String? remoteArtist;
-
-      if (Platform.isAndroid || Platform.isIOS) {
-        // Mobile: pure-Dart audio download (YouTube) with metadata.
-        final result =
-            await AudioDownloadService.instance.downloadAudioWithMetadata(
-          url: url,
-          outputDirectory: root,
-          onProgress: (p) {
-            if (!mounted) return;
-            setState(() {
-              _progress = p;
-              _status = 'Downloading\u2026 ${(p * 100).toStringAsFixed(0)}%';
-              _errorMessage = null;
-            });
-          },
-          onLog: (msg) {
-            if (!mounted) return;
-            setState(() => _status = msg);
-          },
-        );
-        outputPath = result.filePath;
-        remoteTitle = result.title;
-        remoteArtist = result.artist;
-      } else {
-        // Desktop: yt-dlp binary supports many sites natively, so we don't
-        // restrict to YouTube here. Title / artist tagging from yt-dlp is
-        // out of scope for this fix — the row falls back to filename /
-        // "Unknown" exactly like before.
-        final bin = BinaryService.instance.lastResolution;
-        if (bin == null || !bin.ytDlpAvailable) {
-          final detail = bin != null
-              ? bin.errors.join(' ')
-              : 'Binary resolution did not run.';
-          await _setBusy(false, error: 'yt-dlp is not available. $detail');
-          return;
-        }
-
-        outputPath = await DownloadService.downloadUrlToMp3(
-          url: url,
-          outputDirectory: root,
-          ytDlpExecutablePath: bin.ytDlpPath,
-          onProgress: (p) {
-            if (!mounted) return;
-            setState(() {
-              _progress = p.fraction;
-              _status = p.message;
-              _errorMessage = null;
-            });
-          },
-        );
+      final bin = BinaryService.instance.lastResolution;
+      if (bin == null || !bin.ytDlpAvailable) {
+        final detail = bin != null
+            ? bin.errors.join(' ')
+            : 'Binary resolution did not run.';
+        await _setBusy(false, error: 'yt-dlp is not available. $detail');
+        return;
       }
 
+      final root = await PlamusPaths.musicLibraryDirectory();
+      final result = await DownloadService.downloadUrlToMp3WithArtwork(
+        url: url,
+        outputDirectory: root,
+        ytDlpExecutablePath: bin.ytDlpPath,
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() {
+            _progress = p.fraction;
+            _status = p.message;
+            _errorMessage = null;
+          });
+        },
+      );
+
       final id = await lib.registerTrackFile(
-        outputPath,
-        artist: remoteArtist,
-        title: remoteTitle,
-        sourceUrl: AudioDownloadService.isYouTubeUrl(url) ? url : null,
+        result.filePath,
+        sourceUrl: _isYouTubeUrl(url) ? url : null,
+        artworkPath: result.artworkPath,
         inLibrary: widget.addToLibrary,
       );
       await lib.refreshAll();
       widget.onTrackImported?.call(id);
       // Only clear the URL field if it was actually used to drive the
-      // download; tapping a search result must not blow away anything the
-      // user typed in the link tab.
+      // download; tapping a search result must not blow away anything
+      // the user typed in the link tab.
       if (overrideUrl == null) {
         _urlCtrl.clear();
       }
@@ -295,7 +262,7 @@ class _ImportPanelState extends State<ImportPanel> {
     } catch (_) {
       // Map opaque server / network errors to a single friendly inline
       // message — the previous version surfaced raw exception text in a
-      // pink snackbar (BUG 4).
+      // pink snackbar.
       await _setBusy(false, error: 'Invalid or unsupported URL');
     }
   }
@@ -413,16 +380,16 @@ class _ImportPanelState extends State<ImportPanel> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final isMobile = Platform.isAndroid || Platform.isIOS;
 
-    // Only show binary errors on desktop where they matter.
-    final bin = isMobile ? null : BinaryService.instance.lastResolution;
+    // Surface binary-resolution errors inline so missing yt-dlp / ffmpeg
+    // is obvious before the user tries to download.
+    final bin = BinaryService.instance.lastResolution;
 
     // Pick the section for the current tab. Wrapped in [Expanded] when
-    // [widget.fillHeight] is true so the panel fills the parent instead of
-    // forcing an outer scroll view (BUG 4).
+    // [widget.fillHeight] is true so the panel fills the parent instead
+    // of forcing an outer scroll view.
     final Widget tabSection = (_mode == _ImportMode.link || !_supportsSearch)
-        ? _buildLinkSection(theme, isMobile: isMobile)
+        ? _buildLinkSection(theme)
         : _buildSearchSection(theme);
     final wrappedTabSection =
         widget.fillHeight ? Expanded(child: tabSection) : tabSection;
@@ -528,41 +495,39 @@ class _ImportPanelState extends State<ImportPanel> {
   // Link section (secondary — for users who already have a URL)
   // ---------------------------------------------------------------------------
 
-  Widget _buildLinkSection(ThemeData theme, {required bool isMobile}) {
+  Widget _buildLinkSection(ThemeData theme) {
     // The drop zone expands to fill remaining vertical space when
-    // [widget.fillHeight] is true (BUG 4: no outer scroll needed). When
-    // the parent gives us unbounded height (e.g. a bottom-sheet scroll
+    // [widget.fillHeight] is true (no outer scroll needed). When the
+    // parent gives us unbounded height (e.g. a bottom-sheet scroll
     // view) we fall back to a fixed 220px so `Expanded` doesn't blow up.
-    final Widget? dropZone = isMobile
-        ? null
-        : DropTarget(
-            onDragDone: (detail) async {
-              if (_busy) return;
-              for (final f in detail.files) {
-                final path = f.path;
-                if (path.isEmpty) continue;
-                await _ingestPath(path);
-              }
-            },
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: theme.dividerColor.withValues(alpha: 0.4),
-                ),
-              ),
-              child: Center(
-                child: Text(
-                  'Drag and drop audio or video files here',
-                  style: theme.textTheme.bodyLarge?.copyWith(
-                    color: theme.textTheme.bodyLarge?.color
-                        ?.withValues(alpha: 0.75),
-                  ),
-                  textAlign: TextAlign.center,
-                ),
-              ),
+    final Widget dropZone = DropTarget(
+      onDragDone: (detail) async {
+        if (_busy) return;
+        for (final f in detail.files) {
+          final path = f.path;
+          if (path.isEmpty) continue;
+          await _ingestPath(path);
+        }
+      },
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: theme.dividerColor.withValues(alpha: 0.4),
+          ),
+        ),
+        child: Center(
+          child: Text(
+            'Drag and drop audio or video files here',
+            style: theme.textTheme.bodyLarge?.copyWith(
+              color: theme.textTheme.bodyLarge?.color
+                  ?.withValues(alpha: 0.75),
             ),
-          );
+            textAlign: TextAlign.center,
+          ),
+        ),
+      ),
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -571,9 +536,7 @@ class _ImportPanelState extends State<ImportPanel> {
           controller: _urlCtrl,
           decoration: InputDecoration(
             labelText: 'Media link',
-            hintText: isMobile
-                ? 'Paste YouTube link'
-                : 'Paste YouTube, web audio, or video URL',
+            hintText: 'Paste YouTube, web audio, or video URL',
             border: const OutlineInputBorder(),
             // The TextField's own errorText drives the red border + the
             // red helper line below the field, replacing the old snackbar.
@@ -605,13 +568,11 @@ class _ImportPanelState extends State<ImportPanel> {
             ),
           ],
         ),
-        if (dropZone != null) ...[
-          const SizedBox(height: 16),
-          if (widget.fillHeight)
-            Expanded(child: dropZone)
-          else
-            SizedBox(height: 220, child: dropZone),
-        ],
+        const SizedBox(height: 16),
+        if (widget.fillHeight)
+          Expanded(child: dropZone)
+        else
+          SizedBox(height: 220, child: dropZone),
       ],
     );
   }

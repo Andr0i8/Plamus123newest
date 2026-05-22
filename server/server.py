@@ -18,13 +18,20 @@ Endpoints
   following additional headers so the client can populate
   track metadata (see ``YoutubeDownloadService`` in the Dart codebase):
 
-    X-Track-Title:  <video title, percent-encoded>
-    X-Track-Artist: <uploader / channel name, percent-encoded>
+    X-Track-Title:     <video title, percent-encoded>
+    X-Track-Artist:    <uploader / channel name, percent-encoded>
+    X-Track-Thumbnail: <highest-quality thumbnail URL, percent-encoded>
 
 Percent-encoding is used because raw HTTP headers are ASCII-only by spec
 and real YouTube titles routinely contain non-ASCII characters (cyrillic,
 emoji, math symbols, ...). The Dart client decodes these headers with
 ``Uri.decodeComponent`` — see ``YoutubeDownloadService._decodeHeader``.
+
+When the server can resolve a thumbnail URL via yt-dlp's ``thumbnail`` /
+``thumbnails`` info dict the Dart client downloads it directly and saves
+it next to the audio file. Older server builds that don't send this
+header still work because the client falls back to the standard
+``i.ytimg.com/vi/<id>/maxresdefault.jpg`` candidate URLs.
 
 Validation
 ----------
@@ -128,6 +135,8 @@ def download():
             or ""
         ).strip()
 
+        thumbnail_url = _pick_best_thumbnail_url(info)
+
         response = send_file(
             filename,
             as_attachment=True,
@@ -147,8 +156,46 @@ def download():
         response.headers["X-Track-Title"] = quote(title, safe="")
         if artist:
             response.headers["X-Track-Artist"] = quote(artist, safe="")
+        # Highest-quality cover image yt-dlp could resolve — the client
+        # downloads it and saves it next to the audio file as the track
+        # artwork. Optional: client falls back to standard YouTube
+        # thumbnail URLs when this header is missing.
+        if thumbnail_url:
+            response.headers["X-Track-Thumbnail"] = quote(thumbnail_url, safe="")
 
         return response
+
+
+def _pick_best_thumbnail_url(info: dict) -> Optional[str]:
+    """Return the URL of the largest thumbnail yt-dlp returned, if any.
+
+    yt-dlp's ``thumbnails`` list is ordered by quality (lowest → highest)
+    for the YouTube extractor; the simple ``thumbnail`` field exposes
+    that highest entry. We prefer ``thumbnails[-1]`` when it carries an
+    explicit width / height because it lets us pick the actual largest
+    image (some channels deliberately ship a custom maxres that's bigger
+    than what ``thumbnail`` reports). Falls through to the simple field
+    when the structured list is missing or unhelpful.
+    """
+    thumbnails = info.get("thumbnails")
+    if isinstance(thumbnails, list) and thumbnails:
+        # Sort by (width * height) descending; treat unknown sizes as 0
+        # so explicit candidates win.
+        def _area(t: dict) -> int:
+            try:
+                w = int(t.get("width") or 0)
+                h = int(t.get("height") or 0)
+                return max(w * h, 0)
+            except (TypeError, ValueError):
+                return 0
+
+        ranked = sorted(thumbnails, key=_area, reverse=True)
+        for candidate in ranked:
+            url = (candidate.get("url") or "").strip()
+            if url:
+                return url
+    fallback = (info.get("thumbnail") or "").strip()
+    return fallback or None
 
 
 if __name__ == "__main__":
