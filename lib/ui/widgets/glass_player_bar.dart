@@ -322,7 +322,7 @@ class _GlassPlayerBarState extends State<GlassPlayerBar> {
                                             minWidth: 40, minHeight: 40),
                                         padding: EdgeInsets.zero,
                                         tooltip: 'Previous',
-                                        icon: const Icon(
+                                        icon: const FaIcon(
                                             FontAwesomeIcons.backwardStep),
                                         onPressed:
                                             track == null || audio.isLoading
@@ -362,7 +362,7 @@ class _GlassPlayerBarState extends State<GlassPlayerBar> {
                                                       await audio.play();
                                                     }
                                                   },
-                                        child: Icon(
+                                        child: FaIcon(
                                           playing
                                               ? FontAwesomeIcons.pause
                                               : FontAwesomeIcons.play,
@@ -390,7 +390,7 @@ class _GlassPlayerBarState extends State<GlassPlayerBar> {
                                             minWidth: 40, minHeight: 40),
                                         padding: EdgeInsets.zero,
                                         tooltip: 'Next',
-                                        icon: const Icon(
+                                        icon: const FaIcon(
                                             FontAwesomeIcons.forwardStep),
                                         onPressed:
                                             track == null || audio.isLoading
@@ -412,7 +412,7 @@ class _GlassPlayerBarState extends State<GlassPlayerBar> {
                             child: Row(
                               mainAxisAlignment: MainAxisAlignment.end,
                               children: [
-                                Icon(
+                                FaIcon(
                                   _volumeIcon(audio.volume),
                                   size: 20,
                                   color: theme.iconTheme.color
@@ -458,7 +458,7 @@ class _GlassPlayerBarState extends State<GlassPlayerBar> {
     );
   }
 
-  IconData _volumeIcon(double volume) {
+  FaIconData _volumeIcon(double volume) {
     if (volume == 0) return FontAwesomeIcons.volumeXmark;
     if (volume < 0.5) return FontAwesomeIcons.volumeLow;
     return FontAwesomeIcons.volumeHigh;
