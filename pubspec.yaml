@@ -35,7 +35,7 @@ dependencies:
   http: ^1.2.0
 
   # Icons — tree-shaken automatically in release builds.
-  font_awesome_flutter: ^10.7.0
+  font_awesome_flutter: ^11.0.0
 
   # State management for player, library, and theme-driven rebuilds.
   provider: ^6.1.2

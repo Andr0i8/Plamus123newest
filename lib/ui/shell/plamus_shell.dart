@@ -269,7 +269,7 @@ class _PlamusShellState extends State<PlamusShell>
                 return SizeTransition(
                   sizeFactor: _sidebarAnimation,
                   axis: Axis.horizontal,
-                  axisAlignment: -1,
+                  alignment: Alignment.centerLeft,
                   child: Container(
                     width: 280,
                     margin: const EdgeInsets.fromLTRB(16, 16, 16, 16),
@@ -602,7 +602,7 @@ class _NavButton extends StatefulWidget {
   });
 
   final String label;
-  final IconData icon;
+  final FaIconData icon;
   final bool selected;
   final VoidCallback onTap;
 
